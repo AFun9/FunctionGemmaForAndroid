@@ -1,0 +1,138 @@
+plugins {
+    id 'com.android.application'
+}
+
+def ortVersion = '1.23.2'
+def supportedAbis = ['arm64-v8a', 'x86_64']
+def ndkAbiLibDirs = [
+        'arm64-v8a': 'aarch64-linux-android',
+        'x86_64'   : 'x86_64-linux-android'
+]
+
+configurations {
+    onnxRuntimeNative
+}
+
+android {
+    namespace 'com.gemma.functiongemma'
+    compileSdk 34
+    ndkVersion '27.0.12077973'
+
+    defaultConfig {
+        applicationId 'com.gemma.functiongemma'
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName '1.0'
+        testInstrumentationRunner 'androidx.test.runner.AndroidJUnitRunner'
+
+        ndk {
+            abiFilters(*supportedAbis)
+        }
+
+        externalNativeBuild {
+            cmake {
+                cppFlags '-std=c++17 -fexceptions -frtti'
+                arguments '-DANDROID_STL=c++_shared',
+                        "-DONNXRUNTIME_AAR_DIR=${layout.buildDirectory.dir('intermediates/onnxruntime-android').get().asFile.absolutePath}"
+            }
+        }
+    }
+
+    buildTypes {
+        debug {
+            minifyEnabled false
+        }
+        release {
+            minifyEnabled false
+            proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+        }
+    }
+
+    compileOptions {
+        coreLibraryDesugaringEnabled true
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    externalNativeBuild {
+        cmake {
+            path file('../main/cpp/CMakeLists.txt')
+            version '3.22.1'
+        }
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging true
+        }
+    }
+
+    sourceSets {
+        main {
+            manifest.srcFile 'src/main/AndroidManifest.xml'
+            java.srcDirs = ['src/main/java']
+            res.srcDirs = ['src/main/res']
+            assets.srcDirs = ['../model']
+            jniLibs.srcDirs = ['src/main/jniLibs', layout.buildDirectory.dir('intermediates/ndk-shared-stl').get().asFile]
+        }
+    }
+
+    testOptions {
+        unitTests.includeAndroidResources = true
+    }
+}
+
+dependencies {
+    coreLibraryDesugaring 'com.android.tools:desugar_jdk_libs:2.1.5'
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'com.google.android.material:material:1.12.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.2.1'
+    implementation 'com.google.code.gson:gson:2.13.1'
+    implementation "com.microsoft.onnxruntime:onnxruntime-android:${ortVersion}"
+    onnxRuntimeNative "com.microsoft.onnxruntime:onnxruntime-android:${ortVersion}@aar"
+
+    testImplementation 'junit:junit:4.13.2'
+    androidTestImplementation 'androidx.test.ext:junit:1.2.1'
+    androidTestImplementation 'androidx.test.espresso:espresso-core:3.6.1'
+}
+
+def unpackOnnxRuntimeAar = tasks.register('unpackOnnxRuntimeAar', Sync) {
+    from({
+        configurations.onnxRuntimeNative.files.collect { zipTree(it) }
+    }) {
+        include 'headers/**'
+        include 'jni/**'
+    }
+    into layout.buildDirectory.dir('intermediates/onnxruntime-android')
+}
+
+def copyNdkSharedStl = tasks.register('copyNdkSharedStl') {
+    def outputRoot = layout.buildDirectory.dir('intermediates/ndk-shared-stl')
+    outputs.dir(outputRoot)
+    doLast {
+        def baseDir = new File(android.ndkDirectory, 'toolchains/llvm/prebuilt/linux-x86_64/sysroot/usr/lib')
+        supportedAbis.each { abi ->
+            def abiDirName = ndkAbiLibDirs[abi]
+            def sourceFile = new File(baseDir, "${abiDirName}/libc++_shared.so")
+            if (!sourceFile.exists()) {
+                throw new GradleException("Missing NDK shared STL for ${abi}: ${sourceFile}")
+            }
+            copy {
+                from sourceFile
+                into new File(outputRoot.get().asFile, abi)
+            }
+        }
+    }
+}
+
+tasks.named('preBuild').configure {
+    dependsOn(unpackOnnxRuntimeAar)
+    dependsOn(copyNdkSharedStl)
+}
+
+tasks.matching { task ->
+    task.name.startsWith('configureCMake') || task.name.startsWith('buildCMake')
+}.configureEach {
+    dependsOn(unpackOnnxRuntimeAar)
+}

@@ -1,0 +1,23 @@
+# IDE / tool state
+.gradle/
+.idea/
+.codex/
+*.iml
+
+# Local environment
+local.properties
+
+# Build outputs
+build/
+app/build/
+bin/
+main/cpp/build-desktop/
+
+# Downloaded desktop dependencies
+onnxruntime-linux-x64-1.23.2.tgz
+onnxruntime-linux-x64-1.23.2/
+
+# Local model artifacts
+model/
+*.onnx
+*.onnx_data

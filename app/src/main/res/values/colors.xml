@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="canvas_top">#F5EFE4</color>
+    <color name="canvas_bottom">#E6EEF1</color>
+    <color name="panel">#FAF7F0</color>
+    <color name="panel_line">#D9D3C6</color>
+    <color name="hero_start">#FFF4D9</color>
+    <color name="hero_end">#E0EEF4</color>
+    <color name="status_panel">#F7F1E5</color>
+    <color name="status_line">#D8C9AB</color>
+    <color name="input_surface">#FFFDFC</color>
+    <color name="input_line">#D9D2C7</color>
+    <color name="output_panel">#EEF3F2</color>
+    <color name="output_line">#C3D5D0</color>
+    <color name="output_surface">#17242A</color>
+    <color name="output_text">#EAF6F2</color>
+    <color name="fg_primary">#1F2A2C</color>
+    <color name="fg_secondary">#4E5F61</color>
+    <color name="fg_muted">#6F7B7D</color>
+    <color name="fg_hint">#8A8F8F</color>
+    <color name="fg_accent">#7D5A14</color>
+    <color name="button_primary">#1E6B63</color>
+    <color name="button_soft">#E5E0D4</color>
+    <color name="button_warn">#A84C3A</color>
+    <color name="badge_fill">#FFF7E5</color>
+    <color name="badge_line">#E6C989</color>
+    <color name="tab_strip">#DCE6E4</color>
+    <color name="tab_active">#FFF7E7</color>
+    <color name="tab_inactive">#DCE6E4</color>
+    <color name="tab_active_line">#D8C18A</color>
+</resources>
