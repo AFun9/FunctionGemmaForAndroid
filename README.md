@@ -1,109 +1,123 @@
 # FunctionGemmaForAndroid
 
-本项目是一个基于 Gemma / ONNX Runtime 的 Android 本地函数调用实验项目，当前目标是 Android 端离线推理。
+Chinese version: [README.zh-CN.md](README.zh-CN.md)
 
-## 项目结构
+## Overview
 
-- [`app`](app): Android 应用入口、界面、工具执行逻辑。
-- [`main/cpp`](main/cpp): 原生 C++ 推理实现。
-- [`model`](model): 本地模型资产目录，Android 会把它当作 assets 使用。
-- [`python`](python): 把官方模型转换成 ONNX 结构的脚本，需保留。
+FunctionGemmaForAndroid is an Android-first local inference project built around Gemma, ONNX Runtime, and a native C++ execution path. The repository focuses on offline tool calling, lightweight mobile interaction, and a runtime architecture designed for on-device assistant workflows.
 
-## 本地开发环境
+## Repository Structure
 
-### Android 开发必需
+- [`app`](app): Android application module, UI, tool parsing, validation, and execution flow
+- [`main/cpp`](main/cpp): native inference implementation and CMake sources
+- [`model`](model): local model assets packaged as Android application assets
+- [`python`](python): conversion utilities used to transform official Gemma checkpoints into the ONNX layout expected by this project
+- [`FunctionGemma_KVCache_Optimization.md`](FunctionGemma_KVCache_Optimization.md): technical note describing the KV cache optimization strategy used by the runtime
 
-- Android Studio Ladybug 或更高版本
+## Development Environment
+
+### Required Toolchain
+
+- Android Studio Ladybug or newer
 - JDK 17
 - Android SDK 34
 - Android NDK `27.0.12077973`
 - CMake `3.22.1`
 
-### 关键依赖
+### Project Runtime Dependencies
 
 - Android Gradle Plugin `8.5.2`
 - ONNX Runtime Android `1.23.2`
 - `minSdk 26`
 - `targetSdk 34`
 
-### 需要你本机自己提供的内容
+## SDK Configuration
 
-这个仓库当前**不包含**你的本机 SDK 路径配置，所以首次拉起前需要补一项：
-
-1. 在项目根目录创建 `local.properties`
-2. 写入你的 Android SDK 路径，例如：
+This repository does not include machine-specific Android SDK paths. Before building locally, create `local.properties` in the project root and define your SDK directory:
 
 ```properties
 sdk.dir=/home/yourname/Android/Sdk
 ```
 
-或者你也可以通过环境变量提供 SDK 路径，但对 Android Studio 来说，`local.properties` 通常更直接。
+You may also use `ANDROID_HOME` or `ANDROID_SDK_ROOT`, but `local.properties` is the most direct option for Android Studio projects.
 
-## 如何运行 Android 版本
+## Model Assets
 
-### 1. 准备模型目录
-
-Android 工程会把 [`model`](model) 当作 assets 打包。目录下至少需要有这些内容：
+The Android app expects the [`model`](model) directory to contain the converted ONNX runtime assets. At minimum, the project usually requires:
 
 - `tokenizer.json`
 - `tokenizer_config.json`
 - `onnx/model.onnx`
-- 可能还包括 `onnx/model.onnx_data`
+- `onnx/model.onnx_data` when external tensor data is produced
 
-如果你手里是官方模型而不是 ONNX 目录，先用 [`python`](python) 里的转换流程生成 ONNX 结构，再放入 [`model`](model)。
+If you only have the original official model checkpoint, convert it first using the scripts under [`python`](python).
 
-### 2. 构建并安装
+## Build and Run
 
-在项目根目录执行：
+From the project root:
 
 ```bash
 ./gradlew :app:assembleDebug
 ./gradlew :app:installDebug
 ```
 
-或者直接在 Android Studio 里打开项目后运行 `app`。
+You may also open the project in Android Studio and run the `app` module directly.
 
-### 3. 首次启动说明
+## Runtime Notes
 
-- 首次启动会从 assets 中准备模型文件
-- 会加载 tokenizer
-- 会初始化 native model session
-- 首次加载耗时和内存占用都会明显高于后续运行
+- The first launch extracts packaged model assets from the APK.
+- The tokenizer is loaded during initialization.
+- Native model session creation may take noticeable time on first load.
+- Prefix KV cache preparation can increase startup time and memory usage during initial activation.
 
-## Android 开发说明
+## Main Entry Points
 
-### 主要入口
+- [`MainActivity.java`](app/src/main/java/com/gemma/functiongemma/android/MainActivity.java): Android UI and interaction entry point
+- [`FunctionGemmaEngine.java`](app/src/main/java/com/gemma/functiongemma/android/FunctionGemmaEngine.java): inference orchestration and toolset activation
+- [`ToolCallParser.java`](app/src/main/java/com/gemma/functiongemma/android/ToolCallParser.java): model output parsing
+- [`ToolCallFallbackResolver.java`](app/src/main/java/com/gemma/functiongemma/android/ToolCallFallbackResolver.java): post-parse correction for incomplete or incorrect tool calls
+- [`ToolExecutor.java`](app/src/main/java/com/gemma/functiongemma/android/ToolExecutor.java): tool execution layer
+- [`BuiltInToolsets.java`](app/src/main/java/com/gemma/functiongemma/android/BuiltInToolsets.java): built-in tool definitions
 
-- 主界面：[`MainActivity.java`](app/src/main/java/com/gemma/functiongemma/android/MainActivity.java)
-- 推理协调：[`FunctionGemmaEngine.java`](app/src/main/java/com/gemma/functiongemma/android/FunctionGemmaEngine.java)
-- 工具调用解析：[`ToolCallParser.java`](app/src/main/java/com/gemma/functiongemma/android/ToolCallParser.java)
-- 工具执行：[`ToolExecutor.java`](app/src/main/java/com/gemma/functiongemma/android/ToolExecutor.java)
-- 内置工具集：[`BuiltInToolsets.java`](app/src/main/java/com/gemma/functiongemma/android/BuiltInToolsets.java)
+## Tool Call Output Format
 
-### 当前函数调用输出格式
-
-当前模型侧使用的是 FunctionGemma 风格模板，不是 JSON。典型输出类似：
+The runtime is adapted to the FunctionGemma-style function call template rather than plain JSON. A typical tool call looks like:
 
 ```text
 <start_function_call>call:launch_app{app_name:<escape>微信<escape>}<end_function_call>
 ```
 
-解析逻辑已经按这个格式适配。
+## App Mapping Behavior
 
-## 常见问题
+The project supports two layers of application matching:
 
-### 1. `SDK location not found`
+1. Built-in aliases for common apps
+2. Installed-app fallback based on launcher-visible application labels
 
-说明缺少 `local.properties` 或 `ANDROID_HOME` 配置。
+Users may also create custom app aliases from the `Tools` page. This allows a user-defined spoken name to be permanently mapped to a selected installed application.
 
-### 2. GitHub 推送失败，提示模型文件过大
+## Common Issues
 
-[`model`](model) 里的 ONNX 权重通常不适合直接提交到 GitHub。建议：
+### SDK location not found
 
-- 本地保留模型目录
-- 在 git 中忽略 `model/`
-- 仓库只保留代码和转换脚本
+This usually means `local.properties`, `ANDROID_HOME`, or `ANDROID_SDK_ROOT` is missing or incorrect.
 
-### 3. 首次运行内存占用很高
+### Large model files should not be committed
 
-这是模型加载和 ONNX Runtime 初始化阶段的正常现象，尤其是首启和 prefix cache 初始化时更明显。
+Model weights and generated ONNX artifacts can exceed normal Git hosting limits. Keep them in the local [`model`](model) directory and out of version control unless your repository is explicitly configured for large file storage.
+
+
+### Large model files cannot be pushed to GitHub
+
+**English**
+
+The ONNX model files under [`model`](model) are often too large for normal GitHub repository history. In most cases:
+
+- keep model artifacts locally
+- ignore `model/` in Git
+- commit only source code, build logic, and conversion scripts
+
+
+### High memory usage on first load
+
+Elevated memory usage during the first model load is expected, especially during ONNX Runtime initialization and prefix cache preparation.

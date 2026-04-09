@@ -18,6 +18,7 @@ final class ToolExecutionGuard {
         boolean musicIntent = isMusicIntent(normalizedMessage);
         boolean appLaunchIntent = isExplicitLaunchIntent(normalizedMessage);
         boolean navigationIntent = isNavigationIntent(normalizedMessage);
+        boolean systemPanelIntent = isSystemPanelIntent(normalizedMessage);
 
         if (musicIntent && "launch_app".equals(toolCall.name())) {
             String appName = stringArgument(toolCall, "app_name");
@@ -46,6 +47,13 @@ final class ToolExecutionGuard {
             );
         }
 
+        if ("open_system_panel".equals(toolCall.name()) && appLaunchIntent && !systemPanelIntent) {
+            return new ToolExecutionResult(
+                    false,
+                    "Blocked open_system_panel because the request looks like opening an app, not a system panel"
+            );
+        }
+
         return new ToolExecutionResult(true, "Tool call passed validation");
     }
 
@@ -70,6 +78,14 @@ final class ToolExecutionGuard {
                 normalizedMessage,
                 "导航", "去", "到", "前往", "路线", "怎么走", "带我去",
                 "navigate", "navigation", "route", "directions", "take me to"
+        );
+    }
+
+    private static boolean isSystemPanelIntent(String normalizedMessage) {
+        return containsAny(
+                normalizedMessage,
+                "wifi", "wi-fi", "wlan", "蓝牙", "网络", "互联网", "设置", "系统设置", "控制中心",
+                "bluetooth", "internet", "settings"
         );
     }
 

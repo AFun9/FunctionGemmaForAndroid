@@ -71,7 +71,7 @@ private:
         size_t current_buffer;   // 当前使用的缓冲区索引 (0 或 1)
 
         KVCache() : current_seq_len(0), current_buffer(0) {
-            // 预分配最大缓冲区大小的双缓冲区，实现真正的零拷贝
+            // 预分配最大缓冲区大小的双缓冲区
             size_t single_buffer_size = MAX_SEQ_LEN * HEAD_DIM;
             size_t total_buffer_size = NUM_BUFFERS * single_buffer_size;
 

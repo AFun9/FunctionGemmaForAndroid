@@ -27,4 +27,24 @@ public class ToolExecutionGuardTest {
 
         assertTrue(result.executed());
     }
+
+    @Test
+    public void blocksSystemPanelForThirdPartyAppRequest() {
+        ToolExecutionGuard guard = new ToolExecutionGuard(new AppAliasResolver());
+        ToolCall toolCall = new ToolCall("open_system_panel", Map.of());
+
+        ToolExecutionResult result = guard.validate("打开微信", toolCall);
+
+        assertFalse(result.executed());
+    }
+
+    @Test
+    public void allowsSystemPanelForWifiRequest() {
+        ToolExecutionGuard guard = new ToolExecutionGuard(new AppAliasResolver());
+        ToolCall toolCall = new ToolCall("open_system_panel", Map.of("panel", "wifi"));
+
+        ToolExecutionResult result = guard.validate("打开wifi", toolCall);
+
+        assertTrue(result.executed());
+    }
 }

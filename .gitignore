@@ -10,6 +10,7 @@ local.properties
 # Build outputs
 build/
 app/build/
+app/.cxx/
 bin/
 main/cpp/build-desktop/
 

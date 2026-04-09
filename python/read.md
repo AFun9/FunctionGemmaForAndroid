@@ -1,74 +1,119 @@
-# Python 转换说明
+# Python Conversion Guide
 
-[`python`](.) 目录用于把官方 Gemma 模型转换成当前项目可直接使用的 ONNX 目录结构。
+Chinese version: [read.zh-CN.md](read.zh-CN.md)
 
-## 来源
+## Purpose
 
-转换脚本基于官方提供的 `build_gemma.py` 思路整理而来。本项目保留这部分脚本，是因为仓库内的 Android 推理链路依赖转换后的 ONNX 结构，不能直接拿官方原始模型即用。
+The [`python`](.) directory contains the conversion utilities used to transform official Gemma checkpoints into the ONNX asset layout expected by this project.
 
-## 为什么需要项目内这份转换脚本
+These scripts are part of the model preparation workflow. They are not runtime dependencies of the Android application, but they remain necessary for generating compatible model assets.
 
-官方转换逻辑在 prefill 阶段会输出完整序列长度的 logits：
+## Why This Repository Keeps These Scripts
+
+The Android runtime in this repository expects:
+
+- a specific ONNX model layout
+- a tokenizer bundle matching the runtime tokenizer path
+- export behavior aligned with the project's optimized prefill workflow
+
+The conversion logic is based on the official Gemma export approach, but this project retains a runtime-specific optimization for prefill logits.
+
+## Precision Export vs Runtime Support
+
+The conversion script supports multiple export precisions, including:
+
+- `fp32`
+- `fp16`
+- `q4`
+- `q4f16`
+
+However, export support should not be confused with complete runtime support.
+
+An exported low-precision model can still be difficult to run correctly if the inference runtime does not align:
+
+- model I/O dtype
+- KV cache dtype
+- temporary buffer dtype
+- tensor creation APIs on the host side
+
+### Why This Matters for Java
+
+This project does not treat Java as the primary execution layer for low-precision tensors.
+
+In practice:
+
+- Java has no natural `float16[]` array type
+- `fp16` usually has to be represented through bit-packed `short[]`
+- `int4` tensors require manual packing into `byte[]`
+- runtime cache tensors must match the exact ONNX model contract
+
+Because of these constraints, low-precision execution is better handled in JNI/C++ rather than in a Java-only ONNX Runtime path.
+
+### Why FP16 Can Still Show High Memory Usage
+
+Even when the exported weight precision is reduced, total runtime memory can remain high if:
+
+- KV cache is still stored in `float32`
+- some graph segments are promoted to `float32`
+- the runtime allocates additional cast or workspace buffers
+
+For that reason, precision conversion should always be evaluated together with the actual runtime implementation, not only with the exported model size.
+
+## Runtime-Oriented Export Adjustment
+
+The default export pattern may keep logits for the entire sequence:
 
 ```python
 logits_shape = ["batch_size", "sequence_length", "vocab_size"]
 ```
 
-但本项目的实际推理场景里，prefill 阶段只需要最后一个 token 的 logits，因此这里做了针对性优化，输出形状改为：
+In this project, prefill only needs the logits of the final token, so the export is adjusted to:
 
 ```python
 last_logits_shape = ["batch_size", 1, "vocab_size"]
 ```
 
-这样做的好处是：
+This reduces unnecessary memory usage and better matches the autoregressive generation path used by the mobile runtime.
 
-- 减少 prefill 阶段不必要的 logits 内存占用
-- 更适合本项目这种自回归生成场景
-- 更容易在移动端内存预算下运行
+## Prerequisites
 
-## 转换前准备
+Before running the conversion workflow, prepare:
 
-你需要先准备：
+- a working Python environment
+- access to the official Gemma model checkpoint you intend to convert
+- the conversion script [`build_gemma.py`](build_gemma.py)
 
-- Python 运行环境
-- 官方 Gemma 模型
-- 本项目中的 [`build_gemma.py`](build_gemma.py)
+## Example Command
 
-## 基本转换方式
-
-下面是一种典型的转换方式示例：
-
-```python
-model_author = ""
-gemma_model = "myemoji-gemma-3-270m-it"
-
-repo_id = f"{model_author}/{gemma_model}"
-save_path = f"/content/{gemma_model}-onnx"
-```
-
-执行转换：
+A typical conversion command may look like this:
 
 ```bash
 python build_gemma.py \
-    --model_name "${repo_id}" \
-    --output "${save_path}" \
+    --model_name "your-org/your-gemma-model" \
+    --output "/path/to/output/model-onnx" \
     -p fp32 fp16 q4 q4f16
 ```
 
-转换完成后，会得到一个 ONNX 模型目录。
+Adjust the model identifier and output path according to your own environment and model source.
 
-## 如何接入本项目
+## Expected Output
 
-转换后的目录至少应包含：
+After conversion, the generated output should contain the model and tokenizer assets required by the Android application, usually including:
 
 - `tokenizer.json`
 - `tokenizer_config.json`
 - `onnx/model.onnx`
-- 可能还包括 `onnx/model.onnx_data`
+- `onnx/model.onnx_data` when external tensor data is emitted
 
-之后把这些文件放入项目根目录的 [`model`](../model) 中，Android 工程会把它们作为 assets 打包。
+Additional configuration files may also be produced and should be preserved.
 
-## 备注
+## Integration into This Project
 
-- 如果不使用本项目这套转换脚本，生成出来的 ONNX 结构可能无法直接匹配当前推理逻辑
-- 这部分脚本属于模型准备流程，不是运行期代码，但对本项目仍然是必要文件
+Move the converted files into the project-level [`model`](../model) directory.
+
+During the Android build, this directory is packaged as application assets. At runtime, the app extracts and loads the ONNX model and tokenizer files from that asset bundle.
+
+## Notes
+
+- A different export layout may not match the assumptions of this repository's inference runtime.
+- This directory should be treated as part of the reproducible model preparation toolchain, not as temporary helper files.

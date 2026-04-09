@@ -6,9 +6,11 @@ import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
+import android.content.pm.ResolveInfo;
 import android.net.Uri;
 import android.provider.Settings;
 
+import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 
@@ -17,10 +19,10 @@ final class ToolExecutor {
     private final Activity activity;
     private final AppAliasResolver appAliasResolver;
 
-    ToolExecutor(Activity activity) {
+    ToolExecutor(Activity activity, AppAliasResolver appAliasResolver) {
         this.activity = activity;
         this.appContext = activity.getApplicationContext();
-        this.appAliasResolver = new AppAliasResolver();
+        this.appAliasResolver = appAliasResolver;
     }
 
     ToolExecutionResult execute(ToolCall toolCall) {
@@ -45,6 +47,9 @@ final class ToolExecutor {
 
         String packageName = appAliasResolver.resolvePackage(appName);
         if (packageName == null) {
+            packageName = findInstalledLaunchablePackage(appName);
+        }
+        if (packageName == null) {
             return new ToolExecutionResult(false, "No package mapping found for " + appName);
         }
 
@@ -55,6 +60,35 @@ final class ToolExecutor {
         }
         launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         return startActivitySafely(launchIntent, "Opened " + appName, "Unable to open " + appName);
+    }
+
+    private String findInstalledLaunchablePackage(String appName) {
+        String normalizedTarget = normalizeAppName(appName);
+        if (normalizedTarget.isEmpty()) {
+            return null;
+        }
+
+        Intent launcherIntent = new Intent(Intent.ACTION_MAIN);
+        launcherIntent.addCategory(Intent.CATEGORY_LAUNCHER);
+        List<ResolveInfo> candidates = appContext.getPackageManager().queryIntentActivities(launcherIntent, 0);
+
+        String containsMatch = null;
+        for (ResolveInfo candidate : candidates) {
+            CharSequence label = candidate.loadLabel(appContext.getPackageManager());
+            String normalizedLabel = normalizeAppName(label == null ? "" : label.toString());
+            String packageName = candidate.activityInfo == null ? null : candidate.activityInfo.packageName;
+            if (packageName == null || packageName.isBlank()) {
+                continue;
+            }
+            if (normalizedTarget.equals(normalizedLabel)) {
+                return packageName;
+            }
+            if (containsMatch == null
+                    && (normalizedLabel.contains(normalizedTarget) || normalizedTarget.contains(normalizedLabel))) {
+                containsMatch = packageName;
+            }
+        }
+        return containsMatch;
     }
 
     private ToolExecutionResult playMusic(Map<String, Object> arguments) {
@@ -168,6 +202,13 @@ final class ToolExecutor {
             return null;
         }
         return String.valueOf(value);
+    }
+
+    private static String normalizeAppName(String value) {
+        if (value == null) {
+            return "";
+        }
+        return value.trim().replace(" ", "").toLowerCase(Locale.ROOT);
     }
 
     private ToolExecutionResult startActivitySafely(Intent intent, String successMessage, String failureMessage) {

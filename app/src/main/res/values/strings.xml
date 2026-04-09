@@ -8,6 +8,7 @@
     <string name="hint_toolset_name">展示名称，例如：Music Control</string>
     <string name="hint_system_prompt">System prompt</string>
     <string name="hint_tools_json">Tools JSON template</string>
+    <string name="hint_app_alias">给这个软件起一个名字，例如：wechat、支付宝、我的导航</string>
     <string name="label_saved_toolsets">Saved Toolsets</string>
     <string name="button_load">Load Model</string>
     <string name="button_save_toolset">Save Toolset</string>
@@ -15,6 +16,7 @@
     <string name="button_reset_template">Reset Template</string>
     <string name="button_delete_toolset">Delete Selected Toolset</string>
     <string name="button_rebuild_prefix_kv">Rebuild Prefix KV</string>
+    <string name="button_save_app_alias">Save App Mapping</string>
     <string name="button_run">Run Inference</string>
     <string name="button_running">Running…</string>
     <string name="button_execute_tool">Execute Parsed Tool</string>
@@ -33,11 +35,14 @@
     <string name="section_assistant">Assistant</string>
     <string name="section_output">Trace</string>
     <string name="section_studio">Toolset Studio</string>
+    <string name="section_app_aliases">App Mappings</string>
     <string name="prompt_title">Quick Prompt</string>
     <string name="prompt_subtitle">这里只放输入和运行，别的配置放到 Tools 页面。</string>
     <string name="output_subtitle">查看原始输出、解析结果和执行结果。</string>
     <string name="studio_title">Toolset Studio</string>
     <string name="studio_subtitle">这里单独管理 system prompt、tools 和 prefix cache。</string>
+    <string name="app_alias_title">App Mappings</string>
+    <string name="app_alias_subtitle">填一个你习惯说的名字，再从已安装软件里选中目标应用。保存后，打开这个名字就会直接匹配到对应包名。</string>
     <string name="tab_model_output">Model</string>
     <string name="tab_parsed_tool">Parsed</string>
     <string name="tab_execution_result">Execution</string>
@@ -45,4 +50,5 @@
     <string name="studio_toggle_expanded">Collapse</string>
     <string name="studio_summary_empty_title">No active toolset</string>
     <string name="studio_summary_empty_meta">保存或切换一个 toolset 后，这里会显示当前配置、工具数量和 prefix cache 状态。</string>
+    <string name="app_alias_summary_empty">还没有用户添加的 app 映射。</string>
 </resources>

@@ -19,6 +19,8 @@ import com.gemma.functiongemma.R;
 
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Collections;
+import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
 import java.util.Locale;
@@ -39,8 +41,11 @@ public final class MainActivity extends AppCompatActivity {
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
     private FunctionGemmaEngine engine;
+    private AppAliasStore appAliasStore;
+    private AppAliasResolver appAliasResolver;
     private ToolExecutor toolExecutor;
     private ToolExecutionGuard toolExecutionGuard;
+    private ToolCallFallbackResolver toolCallFallbackResolver;
     private ToolCall pendingToolCall;
     private String pendingToolSource;
     private String pendingUserMessage;
@@ -80,9 +85,16 @@ public final class MainActivity extends AppCompatActivity {
     private Button deleteToolsetButton;
     private Button rebuildPrefixCacheButton;
     private Button resetTemplateButton;
+    private Button saveAppAliasButton;
     private Button runButton;
     private Button executeToolButton;
     private ArrayAdapter<String> toolsetAdapter;
+    private ArrayAdapter<InstalledAppOption> installedAppAdapter;
+    private Spinner installedAppSpinner;
+    private EditText appAliasEditText;
+    private TextView appAliasSummaryText;
+    private final List<AppAliasEntry> userAppAliases = new ArrayList<>();
+    private final List<InstalledAppOption> installedApps = new ArrayList<>();
     private final SimpleDateFormat timeFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault());
     private PrefixCacheStatus lastCacheStatus;
 
@@ -92,8 +104,12 @@ public final class MainActivity extends AppCompatActivity {
         setContentView(R.layout.activity_main);
 
         engine = new FunctionGemmaEngine(getApplicationContext());
-        toolExecutor = new ToolExecutor(this);
-        toolExecutionGuard = new ToolExecutionGuard(new AppAliasResolver());
+        appAliasStore = new AppAliasStore(getApplicationContext().getNoBackupFilesDir());
+        loadPersistedAppAliases();
+        appAliasResolver = new AppAliasResolver(userAppAliases);
+        toolExecutor = new ToolExecutor(this, appAliasResolver);
+        toolExecutionGuard = new ToolExecutionGuard(appAliasResolver);
+        toolCallFallbackResolver = new ToolCallFallbackResolver(appAliasResolver);
         statusText = findViewById(R.id.statusText);
         cacheStatusText = findViewById(R.id.cacheStatusText);
         inferenceProgress = findViewById(R.id.inferenceProgress);
@@ -123,15 +139,24 @@ public final class MainActivity extends AppCompatActivity {
         deleteToolsetButton = findViewById(R.id.deleteToolsetButton);
         rebuildPrefixCacheButton = findViewById(R.id.rebuildPrefixCacheButton);
         resetTemplateButton = findViewById(R.id.resetTemplateButton);
+        saveAppAliasButton = findViewById(R.id.saveAppAliasButton);
         runButton = findViewById(R.id.runButton);
         executeToolButton = findViewById(R.id.executeToolButton);
+        installedAppSpinner = findViewById(R.id.installedAppSpinner);
+        appAliasEditText = findViewById(R.id.appAliasEditText);
+        appAliasSummaryText = findViewById(R.id.appAliasSummaryText);
         executeToolButton.setVisibility(View.GONE);
 
         toolsetAdapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, new ArrayList<>());
         toolsetAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         toolsetSpinner.setAdapter(toolsetAdapter);
+        installedAppAdapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, new ArrayList<>());
+        installedAppAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        installedAppSpinner.setAdapter(installedAppAdapter);
 
         refreshToolsetList();
+        refreshInstalledApps();
+        refreshAppAliasSummary();
         populateFieldsFromToolset(engine.getActiveToolsetId());
 
         loadButton.setOnClickListener(view -> loadModel());
@@ -140,6 +165,7 @@ public final class MainActivity extends AppCompatActivity {
         deleteToolsetButton.setOnClickListener(view -> deleteSelectedToolset());
         rebuildPrefixCacheButton.setOnClickListener(view -> rebuildSelectedToolsetCache());
         resetTemplateButton.setOnClickListener(view -> resetTemplate());
+        saveAppAliasButton.setOnClickListener(view -> saveAppAlias());
         runButton.setOnClickListener(view -> runInference());
         executeToolButton.setOnClickListener(view -> executeParsedTool());
         pageAssistantTab.setOnClickListener(view -> selectMainPage(PAGE_ASSISTANT));
@@ -201,21 +227,23 @@ public final class MainActivity extends AppCompatActivity {
             try {
                 String output = engine.generate(toolsetId, userMessage, DEFAULT_MAX_NEW_TOKENS);
                 final ToolCall parsedToolCall = ToolCallParser.parse(output);
-                final String toolSource = parsedToolCall != null ? "model" : "none";
+                final ToolCallResolution resolution = toolCallFallbackResolver.resolve(userMessage, parsedToolCall);
+                final ToolCall resolvedToolCall = resolution.toolCall();
+                final String toolSource = resolution.source();
                 lastRawOutput = output;
-                logInferenceDebug(userMessage, output, parsedToolCall, toolSource);
+                logInferenceDebug(userMessage, output, resolvedToolCall, toolSource);
                 mainHandler.post(() -> {
                     try {
-                        ToolExecutionResult guardResult = toolExecutionGuard.validate(userMessage, parsedToolCall);
+                        ToolExecutionResult guardResult = toolExecutionGuard.validate(userMessage, resolvedToolCall);
                         ToolExecutionResult executionResult = guardResult;
                         clearPendingTool();
-                        if (guardResult.executed() && parsedToolCall != null) {
-                            executionResult = toolExecutor.execute(parsedToolCall);
+                        if (guardResult.executed() && resolvedToolCall != null) {
+                            executionResult = toolExecutor.execute(resolvedToolCall);
                         }
-                        renderOutputSummary(output, parsedToolCall, toolSource, executionResult);
-                        if (parsedToolCall != null && executionResult.executed()) {
+                        renderOutputSummary(output, resolvedToolCall, toolSource, executionResult);
+                        if (resolvedToolCall != null && executionResult.executed()) {
                             updateStatus("Status: inference finished and tool executed");
-                        } else if (parsedToolCall != null) {
+                        } else if (resolvedToolCall != null) {
                             updateStatus("Status: inference finished but tool was not executed");
                         } else {
                             updateStatus("Status: inference finished with no tool call");
@@ -224,7 +252,7 @@ public final class MainActivity extends AppCompatActivity {
                         clearPendingTool();
                         renderOutputSummary(
                                 output,
-                                parsedToolCall,
+                                resolvedToolCall,
                                 toolSource,
                                 new ToolExecutionResult(false, "Post-inference validation failed: " + executionError.getMessage())
                         );
@@ -305,6 +333,34 @@ public final class MainActivity extends AppCompatActivity {
         updateStatus("Status: template reset");
     }
 
+    private void saveAppAlias() {
+        String alias = appAliasEditText.getText().toString().trim();
+        Object selected = installedAppSpinner.getSelectedItem();
+        if (alias.isEmpty()) {
+            updateStatus("Status: please enter an app alias");
+            return;
+        }
+        if (!(selected instanceof InstalledAppOption option)) {
+            updateStatus("Status: please select an installed app");
+            return;
+        }
+
+        AppAliasEntry entry = new AppAliasEntry(alias, option.packageName(), option.label());
+        upsertUserAlias(entry);
+        try {
+            appAliasStore.writeAll(userAppAliases);
+            appAliasResolver = new AppAliasResolver(userAppAliases);
+            toolExecutor = new ToolExecutor(this, appAliasResolver);
+            toolExecutionGuard = new ToolExecutionGuard(appAliasResolver);
+            toolCallFallbackResolver = new ToolCallFallbackResolver(appAliasResolver);
+            refreshAppAliasSummary();
+            appAliasEditText.setText("");
+            updateStatus("Status: saved app alias \"" + alias + "\" -> " + option.label());
+        } catch (Exception error) {
+            updateStatus("Status: failed to save app alias - " + error.getMessage());
+        }
+    }
+
     private void deleteSelectedToolset() {
         Object selected = toolsetSpinner.getSelectedItem();
         if (selected == null) {
@@ -379,6 +435,7 @@ public final class MainActivity extends AppCompatActivity {
         deleteToolsetButton.setEnabled(!busy);
         rebuildPrefixCacheButton.setEnabled(!busy);
         resetTemplateButton.setEnabled(!busy);
+        saveAppAliasButton.setEnabled(!busy);
         runButton.setEnabled(!busy);
         executeToolButton.setEnabled(false);
         inferenceProgress.setVisibility(busy ? View.VISIBLE : View.GONE);
@@ -594,6 +651,82 @@ public final class MainActivity extends AppCompatActivity {
                 + " · Prompt chars: " + activeToolset.systemPrompt().length()
                 + "\n" + cacheLine;
         studioSummaryMetaText.setText(summary);
+    }
+
+    private void loadPersistedAppAliases() {
+        userAppAliases.clear();
+        try {
+            userAppAliases.addAll(appAliasStore.readAll());
+        } catch (Exception error) {
+            Log.w(TAG, "Failed to load app aliases", error);
+        }
+    }
+
+    private void refreshInstalledApps() {
+        installedApps.clear();
+        installedApps.addAll(queryInstalledApps());
+        installedAppAdapter.clear();
+        installedAppAdapter.addAll(installedApps);
+        installedAppAdapter.notifyDataSetChanged();
+    }
+
+    private List<InstalledAppOption> queryInstalledApps() {
+        List<InstalledAppOption> result = new ArrayList<>();
+        var launcherIntent = new android.content.Intent(android.content.Intent.ACTION_MAIN);
+        launcherIntent.addCategory(android.content.Intent.CATEGORY_LAUNCHER);
+        var packageManager = getPackageManager();
+        var resolveInfos = packageManager.queryIntentActivities(launcherIntent, 0);
+        for (var resolveInfo : resolveInfos) {
+            if (resolveInfo.activityInfo == null || resolveInfo.activityInfo.packageName == null) {
+                continue;
+            }
+            CharSequence label = resolveInfo.loadLabel(packageManager);
+            String safeLabel = label == null ? resolveInfo.activityInfo.packageName : label.toString();
+            result.add(new InstalledAppOption(safeLabel, resolveInfo.activityInfo.packageName));
+        }
+        result.sort(Comparator.comparing(InstalledAppOption::label, String.CASE_INSENSITIVE_ORDER));
+        return result;
+    }
+
+    private void refreshAppAliasSummary() {
+        if (appAliasSummaryText == null) {
+            return;
+        }
+        if (userAppAliases.isEmpty()) {
+            appAliasSummaryText.setText(R.string.app_alias_summary_empty);
+            return;
+        }
+        StringBuilder builder = new StringBuilder();
+        int count = Math.min(userAppAliases.size(), 8);
+        for (int i = 0; i < count; i++) {
+            AppAliasEntry entry = userAppAliases.get(i);
+            builder.append(entry.alias())
+                    .append(" -> ")
+                    .append(entry.appLabel() == null || entry.appLabel().isBlank() ? entry.packageName() : entry.appLabel())
+                    .append('\n');
+        }
+        if (userAppAliases.size() > count) {
+            builder.append("... ").append(userAppAliases.size() - count).append(" more");
+        } else if (builder.length() > 0) {
+            builder.setLength(builder.length() - 1);
+        }
+        appAliasSummaryText.setText(builder.toString());
+    }
+
+    private void upsertUserAlias(AppAliasEntry newEntry) {
+        String normalizedAlias = normalizeAlias(newEntry.alias());
+        for (int i = 0; i < userAppAliases.size(); i++) {
+            AppAliasEntry existing = userAppAliases.get(i);
+            if (normalizeAlias(existing.alias()).equals(normalizedAlias)) {
+                userAppAliases.set(i, newEntry);
+                return;
+            }
+        }
+        userAppAliases.add(0, newEntry);
+    }
+
+    private static String normalizeAlias(String value) {
+        return value == null ? "" : value.trim().replace(" ", "").toLowerCase(Locale.ROOT);
     }
 
     private static void logInferenceDebug(
