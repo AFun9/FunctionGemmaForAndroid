@@ -110,24 +110,25 @@ Java 对现代 ONNX 低精度张量类型并没有自然、直接的数组表示
 - [`MainActivity.java`](app/src/main/java/com/gemma/functiongemma/android/MainActivity.java)：Android 界面与交互入口
 - [`FunctionGemmaEngine.java`](app/src/main/java/com/gemma/functiongemma/android/FunctionGemmaEngine.java)：推理协调与 toolset 激活
 - [`ToolCallParser.java`](app/src/main/java/com/gemma/functiongemma/android/ToolCallParser.java)：模型输出解析
-- [`ToolCallFallbackResolver.java`](app/src/main/java/com/gemma/functiongemma/android/ToolCallFallbackResolver.java)：对不完整或错误工具调用的解析后纠偏
 - [`ToolExecutor.java`](app/src/main/java/com/gemma/functiongemma/android/ToolExecutor.java)：工具执行层
 - [`BuiltInToolsets.java`](app/src/main/java/com/gemma/functiongemma/android/BuiltInToolsets.java)：内置工具定义
+- [`UserToolsetTemplate.java`](app/src/main/java/com/gemma/functiongemma/android/UserToolsetTemplate.java)：默认的用户可编辑工具模板
 
 ## 工具调用输出格式
 
 当前运行时适配的是 FunctionGemma 风格的函数调用模板，而不是普通 JSON。一个典型的工具调用输出格式如下：
 
 ```text
-<start_function_call>call:launch_app{app_name:<escape>微信<escape>}<end_function_call>
+<start_function_call>call:open_target{target:<escape>微信<escape>}<end_function_call>
 ```
 
 ## 应用映射机制
 
-当前项目支持两层应用匹配机制：
+默认内置工具集对“打开 X”类请求统一使用 `open_target(target)`。
 
-1. 面向常见应用的内置别名映射
-2. 基于 launcher 可见应用名的已安装软件兜底匹配
+- 对 `open_target`，运行时会直接使用用户原始输入里 `打开` 后面的文本作为 `target`
+- 如果 `target` 是 `settings`、`wifi`、`bluetooth`、`internet` 这类系统目标，就打开对应设置页
+- 否则按应用别名或 launcher 可见应用名尝试打开已安装应用
 
 用户还可以在 `Tools` 页面中添加自定义应用别名，将自己习惯说的名字长期绑定到某个已安装应用。
 

@@ -75,24 +75,25 @@ You may also open the project in Android Studio and run the `app` module directl
 - [`MainActivity.java`](app/src/main/java/com/gemma/functiongemma/android/MainActivity.java): Android UI and interaction entry point
 - [`FunctionGemmaEngine.java`](app/src/main/java/com/gemma/functiongemma/android/FunctionGemmaEngine.java): inference orchestration and toolset activation
 - [`ToolCallParser.java`](app/src/main/java/com/gemma/functiongemma/android/ToolCallParser.java): model output parsing
-- [`ToolCallFallbackResolver.java`](app/src/main/java/com/gemma/functiongemma/android/ToolCallFallbackResolver.java): post-parse correction for incomplete or incorrect tool calls
 - [`ToolExecutor.java`](app/src/main/java/com/gemma/functiongemma/android/ToolExecutor.java): tool execution layer
 - [`BuiltInToolsets.java`](app/src/main/java/com/gemma/functiongemma/android/BuiltInToolsets.java): built-in tool definitions
+- [`UserToolsetTemplate.java`](app/src/main/java/com/gemma/functiongemma/android/UserToolsetTemplate.java): default user-editable tool template
 
 ## Tool Call Output Format
 
 The runtime is adapted to the FunctionGemma-style function call template rather than plain JSON. A typical tool call looks like:
 
 ```text
-<start_function_call>call:launch_app{app_name:<escape>微信<escape>}<end_function_call>
+<start_function_call>call:open_target{target:<escape>微信<escape>}<end_function_call>
 ```
 
 ## App Mapping Behavior
 
-The project supports two layers of application matching:
+The default built-in toolset uses `open_target(target)` for "open X" requests.
 
-1. Built-in aliases for common apps
-2. Installed-app fallback based on launcher-visible application labels
+- For `open_target`, the runtime uses the original text after `打开` from the user message as `target`.
+- If `target` is a settings target such as `settings`, `wifi`, `bluetooth`, or `internet`, the app opens the corresponding settings page.
+- Otherwise the app tries to launch an installed app by alias or launcher-visible application label.
 
 Users may also create custom app aliases from the `Tools` page. This allows a user-defined spoken name to be permanently mapped to a selected installed application.
 
