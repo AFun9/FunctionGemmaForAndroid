@@ -19,7 +19,6 @@ import com.gemma.functiongemma.R;
 
 import java.text.SimpleDateFormat;
 import java.util.ArrayList;
-import java.util.Collections;
 import java.util.Comparator;
 import java.util.Date;
 import java.util.List;
@@ -42,20 +41,7 @@ public final class MainActivity extends AppCompatActivity {
 
     private FunctionGemmaEngine engine;
     private AppAliasStore appAliasStore;
-    private AppAliasResolver appAliasResolver;
     private ToolExecutor toolExecutor;
-    private ToolExecutionGuard toolExecutionGuard;
-    private ToolCallFallbackResolver toolCallFallbackResolver;
-    private ToolCall pendingToolCall;
-    private String pendingToolSource;
-    private String pendingUserMessage;
-    private String lastRawOutput;
-    private String lastRenderedModelOutput = "";
-    private String lastRenderedParsedTool = "";
-    private String lastRenderedExecution = "";
-    private int selectedMainPage = PAGE_ASSISTANT;
-    private int selectedOutputTab = OUTPUT_TAB_MODEL;
-    private boolean studioExpanded;
     private TextView statusText;
     private TextView cacheStatusText;
     private ProgressBar inferenceProgress;
@@ -87,16 +73,18 @@ public final class MainActivity extends AppCompatActivity {
     private Button resetTemplateButton;
     private Button saveAppAliasButton;
     private Button runButton;
-    private Button executeToolButton;
     private ArrayAdapter<String> toolsetAdapter;
     private ArrayAdapter<InstalledAppOption> installedAppAdapter;
     private Spinner installedAppSpinner;
     private EditText appAliasEditText;
     private TextView appAliasSummaryText;
     private final List<AppAliasEntry> userAppAliases = new ArrayList<>();
-    private final List<InstalledAppOption> installedApps = new ArrayList<>();
     private final SimpleDateFormat timeFormat = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.getDefault());
     private PrefixCacheStatus lastCacheStatus;
+
+    private interface BackgroundTask {
+        void run() throws Exception;
+    }
 
     @Override
     protected void onCreate(@Nullable Bundle savedInstanceState) {
@@ -106,10 +94,14 @@ public final class MainActivity extends AppCompatActivity {
         engine = new FunctionGemmaEngine(getApplicationContext());
         appAliasStore = new AppAliasStore(getApplicationContext().getNoBackupFilesDir());
         loadPersistedAppAliases();
-        appAliasResolver = new AppAliasResolver(userAppAliases);
-        toolExecutor = new ToolExecutor(this, appAliasResolver);
-        toolExecutionGuard = new ToolExecutionGuard(appAliasResolver);
-        toolCallFallbackResolver = new ToolCallFallbackResolver(appAliasResolver);
+        rebuildAliasDependencies();
+        bindViews();
+        setupAdapters();
+        bindActions();
+        initializeUiState();
+    }
+
+    private void bindViews() {
         statusText = findViewById(R.id.statusText);
         cacheStatusText = findViewById(R.id.cacheStatusText);
         inferenceProgress = findViewById(R.id.inferenceProgress);
@@ -141,24 +133,21 @@ public final class MainActivity extends AppCompatActivity {
         resetTemplateButton = findViewById(R.id.resetTemplateButton);
         saveAppAliasButton = findViewById(R.id.saveAppAliasButton);
         runButton = findViewById(R.id.runButton);
-        executeToolButton = findViewById(R.id.executeToolButton);
         installedAppSpinner = findViewById(R.id.installedAppSpinner);
         appAliasEditText = findViewById(R.id.appAliasEditText);
         appAliasSummaryText = findViewById(R.id.appAliasSummaryText);
-        executeToolButton.setVisibility(View.GONE);
+    }
 
+    private void setupAdapters() {
         toolsetAdapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, new ArrayList<>());
         toolsetAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         toolsetSpinner.setAdapter(toolsetAdapter);
         installedAppAdapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, new ArrayList<>());
         installedAppAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
         installedAppSpinner.setAdapter(installedAppAdapter);
+    }
 
-        refreshToolsetList();
-        refreshInstalledApps();
-        refreshAppAliasSummary();
-        populateFieldsFromToolset(engine.getActiveToolsetId());
-
+    private void bindActions() {
         loadButton.setOnClickListener(view -> loadModel());
         saveToolsetButton.setOnClickListener(view -> saveToolset());
         useSelectedToolsetButton.setOnClickListener(view -> useSelectedToolset());
@@ -167,19 +156,22 @@ public final class MainActivity extends AppCompatActivity {
         resetTemplateButton.setOnClickListener(view -> resetTemplate());
         saveAppAliasButton.setOnClickListener(view -> saveAppAlias());
         runButton.setOnClickListener(view -> runInference());
-        executeToolButton.setOnClickListener(view -> executeParsedTool());
         pageAssistantTab.setOnClickListener(view -> selectMainPage(PAGE_ASSISTANT));
         pageToolsTab.setOnClickListener(view -> selectMainPage(PAGE_TOOLS));
         tabModelOutput.setOnClickListener(view -> selectOutputTab(OUTPUT_TAB_MODEL));
         tabParsedTool.setOnClickListener(view -> selectOutputTab(OUTPUT_TAB_PARSED));
         tabExecutionResult.setOnClickListener(view -> selectOutputTab(OUTPUT_TAB_EXECUTION));
-        studioToggleText.setOnClickListener(view -> setStudioExpanded(!studioExpanded));
+        studioToggleText.setOnClickListener(view -> setStudioExpanded(studioContent == null || studioContent.getVisibility() != View.VISIBLE));
+    }
 
+    private void initializeUiState() {
+        syncToolsetUi(engine.getActiveToolsetId());
+        refreshInstalledApps();
+        refreshAppAliasSummary();
         selectMainPage(PAGE_ASSISTANT);
         setStudioExpanded(false);
         selectOutputTab(OUTPUT_TAB_MODEL);
-        renderOutputPanels("", "", "");
-        updateStudioSummary();
+        clearOutputPanels();
     }
 
     @Override
@@ -190,20 +182,12 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private void loadModel() {
-        setBusy(true);
-        updateStatus("Status: extracting assets and loading model...");
-        executor.execute(() -> {
-            try {
-                engine.load(status -> mainHandler.post(() -> updateStatus(status)));
-                mainHandler.post(() -> {
-                    updateStatus("Status: model loaded and ready");
-                    updateCacheStatus(engine.getActiveToolsetCacheStatus());
-                    refreshToolsetList();
-                    setBusy(false);
-                });
-            } catch (Exception error) {
-                showError(error);
-            }
+        executeBusyTask("Status: extracting assets and loading model...", () -> {
+            engine.load(status -> mainHandler.post(() -> updateStatus(status)));
+            finishBusyTask(() -> {
+                updateStatus("Status: model loaded and ready");
+                syncToolsetUi(engine.getActiveToolsetId());
+            });
         });
     }
 
@@ -221,38 +205,32 @@ public final class MainActivity extends AppCompatActivity {
 
         setBusy(true);
         updateStatus("Status: running inference...");
-        renderOutputPanels("", "", "");
-        clearPendingTool();
+        clearOutputPanels();
         executor.execute(() -> {
             try {
                 String output = engine.generate(toolsetId, userMessage, DEFAULT_MAX_NEW_TOKENS);
                 final ToolCall parsedToolCall = ToolCallParser.parse(output);
-                final ToolCallResolution resolution = toolCallFallbackResolver.resolve(userMessage, parsedToolCall);
-                final ToolCall resolvedToolCall = resolution.toolCall();
-                final String toolSource = resolution.source();
-                lastRawOutput = output;
-                logInferenceDebug(userMessage, output, resolvedToolCall, toolSource);
+                final ToolCall effectiveToolCall = normalizeToolCall(userMessage, parsedToolCall);
+                final String toolSource = effectiveToolCall == null ? "none" : "model";
+                logInferenceDebug(userMessage, output, effectiveToolCall, toolSource);
                 mainHandler.post(() -> {
                     try {
-                        ToolExecutionResult guardResult = toolExecutionGuard.validate(userMessage, resolvedToolCall);
-                        ToolExecutionResult executionResult = guardResult;
-                        clearPendingTool();
-                        if (guardResult.executed() && resolvedToolCall != null) {
-                            executionResult = toolExecutor.execute(resolvedToolCall);
+                        ToolExecutionResult executionResult = null;
+                        if (effectiveToolCall != null) {
+                            executionResult = toolExecutor.execute(effectiveToolCall);
                         }
-                        renderOutputSummary(output, resolvedToolCall, toolSource, executionResult);
-                        if (resolvedToolCall != null && executionResult.executed()) {
+                        renderOutputSummary(output, effectiveToolCall, toolSource, executionResult);
+                        if (effectiveToolCall != null && executionResult != null && executionResult.executed()) {
                             updateStatus("Status: inference finished and tool executed");
-                        } else if (resolvedToolCall != null) {
+                        } else if (effectiveToolCall != null) {
                             updateStatus("Status: inference finished but tool was not executed");
                         } else {
                             updateStatus("Status: inference finished with no tool call");
                         }
                     } catch (Exception executionError) {
-                        clearPendingTool();
                         renderOutputSummary(
                                 output,
-                                resolvedToolCall,
+                                effectiveToolCall,
                                 toolSource,
                                 new ToolExecutionResult(false, "Post-inference validation failed: " + executionError.getMessage())
                         );
@@ -267,6 +245,32 @@ public final class MainActivity extends AppCompatActivity {
         });
     }
 
+    private ToolCall normalizeToolCall(String userMessage, @Nullable ToolCall toolCall) {
+        if (toolCall == null || !"open_target".equals(toolCall.name())) {
+            return toolCall;
+        }
+        String extractedTarget = extractOpenTarget(userMessage);
+        if (extractedTarget == null) {
+            return toolCall;
+        }
+        java.util.Map<String, Object> arguments = new java.util.LinkedHashMap<>(toolCall.arguments());
+        arguments.put("target", extractedTarget);
+        return new ToolCall(toolCall.name(), arguments);
+    }
+
+    @Nullable
+    private String extractOpenTarget(String userMessage) {
+        if (userMessage == null) {
+            return null;
+        }
+        int marker = userMessage.lastIndexOf("打开");
+        if (marker < 0) {
+            return null;
+        }
+        String target = userMessage.substring(marker + 2).trim();
+        return target.isEmpty() ? null : target;
+    }
+
     private void saveToolset() {
         String toolsetId = toolsetIdEditText.getText().toString().trim();
         String displayName = toolsetNameEditText.getText().toString().trim();
@@ -278,51 +282,32 @@ public final class MainActivity extends AppCompatActivity {
             return;
         }
 
-        setBusy(true);
-        updateStatus("Status: validating and caching toolset...");
-        executor.execute(() -> {
-            try {
-                engine.registerOrReplaceToolset(
-                        toolsetId,
-                        displayName,
-                        systemPrompt,
-                        UserToolsetTemplate.parseToolsJson(toolsJson)
-                );
-                engine.activateToolset(toolsetId);
-                mainHandler.post(() -> {
-                    refreshToolsetList();
-                    selectToolset(toolsetId);
-                    updateCacheStatus(engine.getActiveToolsetCacheStatus());
-                    updateStatus("Status: toolset " + toolsetId + " saved and activated");
-                    setBusy(false);
-                });
-            } catch (Exception error) {
-                showError(error);
-            }
+        executeBusyTask("Status: validating and caching toolset...", () -> {
+            engine.registerOrReplaceToolset(new ToolsetDefinition(
+                    toolsetId,
+                    displayName,
+                    systemPrompt,
+                    UserToolsetTemplate.parseToolsJson(toolsJson)
+            ));
+            engine.activateToolset(toolsetId);
+            finishBusyTask(() -> {
+                syncToolsetUi(toolsetId);
+                updateStatus("Status: toolset " + toolsetId + " saved and activated");
+            });
         });
     }
 
     private void useSelectedToolset() {
-        Object selected = toolsetSpinner.getSelectedItem();
-        if (selected == null) {
-            updateStatus("Status: no saved toolset selected");
+        String toolsetId = requireSelectedToolsetId("Status: no saved toolset selected");
+        if (toolsetId == null) {
             return;
         }
-        String toolsetId = selected.toString();
-        setBusy(true);
-        updateStatus("Status: activating toolset " + toolsetId + "...");
-        executor.execute(() -> {
-            try {
-                engine.activateToolset(toolsetId);
-                mainHandler.post(() -> {
-                    populateFieldsFromToolset(toolsetId);
-                    updateCacheStatus(engine.getActiveToolsetCacheStatus());
-                    updateStatus("Status: activated toolset " + toolsetId);
-                    setBusy(false);
-                });
-            } catch (Exception error) {
-                showError(error);
-            }
+        executeBusyTask("Status: activating toolset " + toolsetId + "...", () -> {
+            engine.activateToolset(toolsetId);
+            finishBusyTask(() -> {
+                syncToolsetUi(toolsetId);
+                updateStatus("Status: activated toolset " + toolsetId);
+            });
         });
     }
 
@@ -349,10 +334,7 @@ public final class MainActivity extends AppCompatActivity {
         upsertUserAlias(entry);
         try {
             appAliasStore.writeAll(userAppAliases);
-            appAliasResolver = new AppAliasResolver(userAppAliases);
-            toolExecutor = new ToolExecutor(this, appAliasResolver);
-            toolExecutionGuard = new ToolExecutionGuard(appAliasResolver);
-            toolCallFallbackResolver = new ToolCallFallbackResolver(appAliasResolver);
+            rebuildAliasDependencies();
             refreshAppAliasSummary();
             appAliasEditText.setText("");
             updateStatus("Status: saved app alias \"" + alias + "\" -> " + option.label());
@@ -362,55 +344,34 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private void deleteSelectedToolset() {
-        Object selected = toolsetSpinner.getSelectedItem();
-        if (selected == null) {
-            updateStatus("Status: no toolset selected to delete");
+        String toolsetId = requireSelectedToolsetId("Status: no toolset selected to delete");
+        if (toolsetId == null) {
             return;
         }
-        String toolsetId = selected.toString();
-        setBusy(true);
-        updateStatus("Status: deleting toolset " + toolsetId + "...");
-        executor.execute(() -> {
-            try {
-                boolean deleted = engine.deleteToolset(toolsetId);
-                mainHandler.post(() -> {
-                    refreshToolsetList();
-                    populateFieldsFromToolset(engine.getActiveToolsetId());
-                    if (deleted) {
-                        updateCacheStatus(engine.getActiveToolsetCacheStatus());
-                        updateStatus("Status: deleted toolset " + toolsetId);
-                    } else {
-                        updateStatus("Status: built-in toolset cannot be deleted");
-                    }
-                    setBusy(false);
-                });
-            } catch (Exception error) {
-                showError(error);
-            }
+        executeBusyTask("Status: deleting toolset " + toolsetId + "...", () -> {
+            boolean deleted = engine.deleteToolset(toolsetId);
+            finishBusyTask(() -> {
+                syncToolsetUi(engine.getActiveToolsetId());
+                if (deleted) {
+                    updateStatus("Status: deleted toolset " + toolsetId);
+                } else {
+                    updateStatus("Status: built-in toolset cannot be deleted");
+                }
+            });
         });
     }
 
     private void rebuildSelectedToolsetCache() {
-        Object selected = toolsetSpinner.getSelectedItem();
-        if (selected == null) {
-            updateStatus("Status: no toolset selected to rebuild");
+        String toolsetId = requireSelectedToolsetId("Status: no toolset selected to rebuild");
+        if (toolsetId == null) {
             return;
         }
-        String toolsetId = selected.toString();
-        setBusy(true);
-        updateStatus("Status: rebuilding prefix KV for " + toolsetId + "...");
-        executor.execute(() -> {
-            try {
-                engine.rebuildToolsetCache(toolsetId);
-                mainHandler.post(() -> {
-                    populateFieldsFromToolset(toolsetId);
-                    updateCacheStatus(engine.getActiveToolsetCacheStatus());
-                    updateStatus("Status: rebuilt prefix KV for " + toolsetId);
-                    setBusy(false);
-                });
-            } catch (Exception error) {
-                showError(error);
-            }
+        executeBusyTask("Status: rebuilding prefix KV for " + toolsetId + "...", () -> {
+            engine.rebuildToolsetCache(toolsetId);
+            finishBusyTask(() -> {
+                syncToolsetUi(toolsetId);
+                updateStatus("Status: rebuilt prefix KV for " + toolsetId);
+            });
         });
     }
 
@@ -420,6 +381,25 @@ public final class MainActivity extends AppCompatActivity {
             selectMainPage(PAGE_ASSISTANT);
             renderOutputPanels("", "", error.toString());
             selectOutputTab(OUTPUT_TAB_EXECUTION);
+            setBusy(false);
+        });
+    }
+
+    private void executeBusyTask(String status, BackgroundTask task) {
+        setBusy(true);
+        updateStatus(status);
+        executor.execute(() -> {
+            try {
+                task.run();
+            } catch (Exception error) {
+                showError(error);
+            }
+        });
+    }
+
+    private void finishBusyTask(Runnable task) {
+        mainHandler.post(() -> {
+            task.run();
             setBusy(false);
         });
     }
@@ -437,45 +417,19 @@ public final class MainActivity extends AppCompatActivity {
         resetTemplateButton.setEnabled(!busy);
         saveAppAliasButton.setEnabled(!busy);
         runButton.setEnabled(!busy);
-        executeToolButton.setEnabled(false);
         inferenceProgress.setVisibility(busy ? View.VISIBLE : View.GONE);
         runButton.setText(busy ? R.string.button_running : R.string.button_run);
     }
 
-    private void executeParsedTool() {
-        updateStatus("Status: tool calls are executed automatically after parsing");
-    }
-
-    private void clearPendingTool() {
-        pendingToolCall = null;
-        pendingToolSource = null;
-        pendingUserMessage = null;
-        lastRawOutput = null;
-        if (executeToolButton != null) {
-            executeToolButton.setEnabled(false);
-            executeToolButton.setVisibility(View.GONE);
-        }
-    }
-
     private void setStudioExpanded(boolean expanded) {
-        studioExpanded = expanded;
-        if (studioContent != null) {
-            studioContent.setVisibility(expanded ? View.VISIBLE : View.GONE);
-        }
-        if (studioToggleText != null) {
-            studioToggleText.setText(expanded ? R.string.studio_toggle_expanded : R.string.studio_toggle_collapsed);
-        }
+        studioContent.setVisibility(expanded ? View.VISIBLE : View.GONE);
+        studioToggleText.setText(expanded ? R.string.studio_toggle_expanded : R.string.studio_toggle_collapsed);
     }
 
     private void selectMainPage(int page) {
-        selectedMainPage = page;
         boolean showAssistant = page == PAGE_ASSISTANT;
-        if (assistantPage != null) {
-            assistantPage.setVisibility(showAssistant ? View.VISIBLE : View.GONE);
-        }
-        if (toolsPage != null) {
-            toolsPage.setVisibility(showAssistant ? View.GONE : View.VISIBLE);
-        }
+        assistantPage.setVisibility(showAssistant ? View.VISIBLE : View.GONE);
+        toolsPage.setVisibility(showAssistant ? View.GONE : View.VISIBLE);
         applyTabVisual(pageAssistantTab, showAssistant);
         applyTabVisual(pageToolsTab, !showAssistant);
     }
@@ -485,20 +439,31 @@ public final class MainActivity extends AppCompatActivity {
         toolsetAdapter.clear();
         toolsetAdapter.addAll(toolsetIds);
         toolsetAdapter.notifyDataSetChanged();
-        selectToolset(engine.getActiveToolsetId());
+        String activeToolsetId = engine.getActiveToolsetId();
+        if (activeToolsetId != null) {
+            for (int i = 0; i < toolsetAdapter.getCount(); i++) {
+                if (activeToolsetId.equals(toolsetAdapter.getItem(i))) {
+                    toolsetSpinner.setSelection(i);
+                    break;
+                }
+            }
+        }
         updateStudioSummary();
     }
 
-    private void selectToolset(String toolsetId) {
-        if (toolsetId == null) {
-            return;
+    private void syncToolsetUi(String toolsetId) {
+        refreshToolsetList();
+        populateFieldsFromToolset(toolsetId);
+        updateCacheStatus(engine.getActiveToolsetCacheStatus());
+    }
+
+    private String requireSelectedToolsetId(String emptyStatus) {
+        Object selected = toolsetSpinner.getSelectedItem();
+        if (selected == null) {
+            updateStatus(emptyStatus);
+            return null;
         }
-        for (int i = 0; i < toolsetAdapter.getCount(); i++) {
-            if (toolsetId.equals(toolsetAdapter.getItem(i))) {
-                toolsetSpinner.setSelection(i);
-                return;
-            }
-        }
+        return selected.toString();
     }
 
     private void populateFieldsFromToolset(String toolsetId) {
@@ -572,22 +537,16 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private void renderOutputPanels(String modelOutput, String parsedToolOutput, String executionOutput) {
-        lastRenderedModelOutput = modelOutput == null || modelOutput.isBlank() ? "(empty)" : modelOutput;
-        lastRenderedParsedTool = parsedToolOutput == null || parsedToolOutput.isBlank() ? "(empty)" : parsedToolOutput;
-        lastRenderedExecution = executionOutput == null || executionOutput.isBlank() ? "(empty)" : executionOutput;
-        if (modelOutputText != null) {
-            modelOutputText.setText(lastRenderedModelOutput);
-        }
-        if (parsedToolText != null) {
-            parsedToolText.setText(lastRenderedParsedTool);
-        }
-        if (executionOutputText != null) {
-            executionOutputText.setText(lastRenderedExecution);
-        }
+        setPanelText(modelOutputText, modelOutput);
+        setPanelText(parsedToolText, parsedToolOutput);
+        setPanelText(executionOutputText, executionOutput);
+    }
+
+    private void clearOutputPanels() {
+        renderOutputPanels("", "", "");
     }
 
     private void selectOutputTab(int tab) {
-        selectedOutputTab = tab;
         boolean showModel = tab == OUTPUT_TAB_MODEL;
         boolean showParsed = tab == OUTPUT_TAB_PARSED;
         boolean showExecution = tab == OUTPUT_TAB_EXECUTION;
@@ -602,30 +561,21 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private void selectBestOutputTab(@Nullable ToolCall toolCall, @Nullable ToolExecutionResult executionResult) {
-        if (executionResult != null) {
-            selectOutputTab(OUTPUT_TAB_EXECUTION);
-            return;
-        }
-        if (toolCall != null) {
-            selectOutputTab(OUTPUT_TAB_PARSED);
-            return;
-        }
-        selectOutputTab(OUTPUT_TAB_MODEL);
+        selectOutputTab(executionResult != null
+                ? OUTPUT_TAB_EXECUTION
+                : toolCall != null ? OUTPUT_TAB_PARSED : OUTPUT_TAB_MODEL);
     }
 
     private void applyTabVisual(TextView tabView, boolean selected) {
-        if (tabView == null) {
-            return;
-        }
         tabView.setBackgroundResource(selected ? R.drawable.bg_tab_active : R.drawable.bg_tab_inactive);
         tabView.setTextColor(getColor(selected ? R.color.fg_primary : R.color.fg_secondary));
     }
 
-    private void updateStudioSummary() {
-        if (studioSummaryTitleText == null || studioSummaryMetaText == null) {
-            return;
-        }
+    private static void setPanelText(TextView textView, String value) {
+        textView.setText(value == null || value.isBlank() ? "(empty)" : value);
+    }
 
+    private void updateStudioSummary() {
         String activeToolsetId = engine.getActiveToolsetId();
         ToolsetDefinition activeToolset = activeToolsetId == null ? null : engine.getToolset(activeToolsetId);
         if (activeToolset == null) {
@@ -662,11 +612,13 @@ public final class MainActivity extends AppCompatActivity {
         }
     }
 
+    private void rebuildAliasDependencies() {
+        toolExecutor = new ToolExecutor(this, new AppAliasResolver(userAppAliases));
+    }
+
     private void refreshInstalledApps() {
-        installedApps.clear();
-        installedApps.addAll(queryInstalledApps());
         installedAppAdapter.clear();
-        installedAppAdapter.addAll(installedApps);
+        installedAppAdapter.addAll(queryInstalledApps());
         installedAppAdapter.notifyDataSetChanged();
     }
 
@@ -689,9 +641,6 @@ public final class MainActivity extends AppCompatActivity {
     }
 
     private void refreshAppAliasSummary() {
-        if (appAliasSummaryText == null) {
-            return;
-        }
         if (userAppAliases.isEmpty()) {
             appAliasSummaryText.setText(R.string.app_alias_summary_empty);
             return;

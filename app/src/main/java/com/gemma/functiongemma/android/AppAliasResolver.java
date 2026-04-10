@@ -1,22 +1,15 @@
 package com.gemma.functiongemma.android;
 
-import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
-import java.util.Set;
 
 final class AppAliasResolver {
     private final Map<String, String> packageByAlias = new LinkedHashMap<>();
-    private final Set<String> musicPackages = new HashSet<>();
-
-    AppAliasResolver() {
-        this(List.of());
-    }
 
     AppAliasResolver(List<AppAliasEntry> userAliases) {
-        registerAliases(new String[][] {
+        for (String[] entry : new String[][] {
                 {"天气", "com.coloros.weather2"},
                 {"家人守护", "com.coloros.familyguard"},
                 {"美柚", "com.lingan.seeyou"},
@@ -97,26 +90,18 @@ final class AppAliasResolver {
                 {"chrome", "com.android.chrome"},
                 {"高德", "com.autonavi.minimap"},
                 {"高德地图", "com.autonavi.minimap"},
-                {"amap", "com.autonavi.minimap"}
-        });
-        registerMusicApp("qq音乐", "com.tencent.qqmusic");
-        registerMusicApp("qq music", "com.tencent.qqmusic");
-        registerMusicApp("网易云", "com.netease.cloudmusic");
-        registerMusicApp("网易云音乐", "com.netease.cloudmusic");
-        registerMusicApp("netease music", "com.netease.cloudmusic");
-        registerMusicApp("spotify", "com.spotify.music");
-        registerMusicApp("youtube music", "com.google.android.apps.youtube.music");
-        register("chrome", "com.android.chrome");
-        register("浏览器", "com.android.chrome");
-        registerMusicApp("music", "com.tencent.qqmusic");
-        registerMusicApp("音乐", "com.tencent.qqmusic");
-        registerUserAliases(userAliases);
-    }
-
-    private void registerAliases(String[][] aliases) {
-        for (String[] entry : aliases) {
+                {"amap", "com.autonavi.minimap"},
+                {"qq music", "com.tencent.qqmusic"},
+                {"网易云", "com.netease.cloudmusic"},
+                {"netease music", "com.netease.cloudmusic"},
+                {"spotify", "com.spotify.music"},
+                {"youtube music", "com.google.android.apps.youtube.music"},
+                {"music", "com.tencent.qqmusic"},
+                {"音乐", "com.tencent.qqmusic"}
+        }) {
             register(entry[0], entry[1]);
         }
+        registerUserAliases(userAliases);
     }
 
     private void registerUserAliases(List<AppAliasEntry> aliases) {
@@ -134,13 +119,8 @@ final class AppAliasResolver {
         }
     }
 
-    void register(String alias, String packageName) {
+    private void register(String alias, String packageName) {
         packageByAlias.put(normalize(alias), packageName);
-    }
-
-    void registerMusicApp(String alias, String packageName) {
-        register(alias, packageName);
-        musicPackages.add(packageName);
     }
 
     String resolvePackage(String appName) {
@@ -148,28 +128,6 @@ final class AppAliasResolver {
             return null;
         }
         return packageByAlias.get(normalize(appName));
-    }
-
-    boolean isMusicAppName(String appName) {
-        String packageName = resolvePackage(appName);
-        return packageName != null && musicPackages.contains(packageName);
-    }
-
-    String findKnownAliasInText(String text) {
-        if (text == null || text.trim().isEmpty()) {
-            return null;
-        }
-        String normalizedText = normalize(text);
-        String bestAlias = null;
-        for (String alias : packageByAlias.keySet()) {
-            if (!normalizedText.contains(alias)) {
-                continue;
-            }
-            if (bestAlias == null || alias.length() > bestAlias.length()) {
-                bestAlias = alias;
-            }
-        }
-        return bestAlias;
     }
 
     private static String normalize(String value) {

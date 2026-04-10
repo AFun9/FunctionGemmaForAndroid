@@ -18,6 +18,10 @@ android {
     compileSdk 34
     ndkVersion '27.0.12077973'
 
+    androidResources {
+        noCompress += ['onnx', 'onnx_data']
+    }
+
     defaultConfig {
         applicationId 'com.gemma.functiongemma'
         minSdk 26
@@ -73,7 +77,7 @@ android {
             manifest.srcFile 'src/main/AndroidManifest.xml'
             java.srcDirs = ['src/main/java']
             res.srcDirs = ['src/main/res']
-            assets.srcDirs = ['../model']
+            assets.srcDirs = [layout.buildDirectory.dir('intermediates/model-assets').get().asFile]
             jniLibs.srcDirs = ['src/main/jniLibs', layout.buildDirectory.dir('intermediates/ndk-shared-stl').get().asFile]
         }
     }
@@ -126,9 +130,31 @@ def copyNdkSharedStl = tasks.register('copyNdkSharedStl') {
     }
 }
 
+def prepareModelAssets = tasks.register('prepareModelAssets', Sync) {
+    into layout.buildDirectory.dir('intermediates/model-assets')
+
+    from('../model') {
+        include 'config.json'
+        include 'generation_config.json'
+        include 'tokenizer.json'
+        include 'tokenizer_config.json'
+        include 'special_tokens_map.json'
+        include 'added_tokens.json'
+        include 'chat_template.jinja'
+        include 'tokenizer.model'
+    }
+
+    from('../model/onnx') {
+        include 'model.onnx'
+        include 'model.onnx_data'
+        into 'onnx'
+    }
+}
+
 tasks.named('preBuild').configure {
     dependsOn(unpackOnnxRuntimeAar)
     dependsOn(copyNdkSharedStl)
+    dependsOn(prepareModelAssets)
 }
 
 tasks.matching { task ->

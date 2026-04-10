@@ -1,7 +1,6 @@
 package com.gemma.functiongemma.android;
 
 import android.app.Activity;
-import android.bluetooth.BluetoothAdapter;
 import android.content.ActivityNotFoundException;
 import android.content.Context;
 import android.content.Intent;
@@ -17,11 +16,13 @@ import java.util.Map;
 final class ToolExecutor {
     private final Context appContext;
     private final Activity activity;
+    private final PackageManager packageManager;
     private final AppAliasResolver appAliasResolver;
 
     ToolExecutor(Activity activity, AppAliasResolver appAliasResolver) {
         this.activity = activity;
         this.appContext = activity.getApplicationContext();
+        this.packageManager = appContext.getPackageManager();
         this.appAliasResolver = appAliasResolver;
     }
 
@@ -30,11 +31,12 @@ final class ToolExecutor {
             return new ToolExecutionResult(false, "No tool call to execute");
         }
         return switch (toolCall.name()) {
+            case "open_target" -> openTarget(toolCall.arguments());
             case "launch_app" -> launchApp(toolCall.arguments());
             case "navigate" -> navigate(toolCall.arguments());
             case "play_music" -> playMusic(toolCall.arguments());
             case "web_search" -> webSearch(toolCall.arguments());
-            case "open_system_panel" -> openSystemPanel(toolCall.arguments());
+            case "open_system_panel", "open_settings" -> openSystemPanel(toolCall.arguments());
             default -> new ToolExecutionResult(false, "Unsupported tool: " + toolCall.name());
         };
     }
@@ -43,6 +45,25 @@ final class ToolExecutor {
         String appName = readString(arguments, "app_name");
         if (appName == null) {
             return new ToolExecutionResult(false, "launch_app requires app_name");
+        }
+        return launchAppByName(appName, "launch_app requires app_name");
+    }
+
+    private ToolExecutionResult openTarget(Map<String, Object> arguments) {
+        String target = readString(arguments, "target");
+        if (target == null || target.isBlank()) {
+            return new ToolExecutionResult(false, "open_target requires target");
+        }
+        String settingsTarget = normalizeSettingsTarget(target);
+        if (settingsTarget != null) {
+            return openSystemPanelByName(settingsTarget, "open_target requires target");
+        }
+        return launchAppByName(target, "open_target requires target");
+    }
+
+    private ToolExecutionResult launchAppByName(String appName, String missingMessage) {
+        if (appName == null || appName.isBlank()) {
+            return new ToolExecutionResult(false, missingMessage);
         }
 
         String packageName = appAliasResolver.resolvePackage(appName);
@@ -53,12 +74,10 @@ final class ToolExecutor {
             return new ToolExecutionResult(false, "No package mapping found for " + appName);
         }
 
-        PackageManager packageManager = appContext.getPackageManager();
-        Intent launchIntent = packageManager.getLaunchIntentForPackage(packageName);
+        Intent launchIntent = createLaunchIntent(packageName);
         if (launchIntent == null) {
             return new ToolExecutionResult(false, "App is not installed: " + appName + " (" + packageName + ")");
         }
-        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
         return startActivitySafely(launchIntent, "Opened " + appName, "Unable to open " + appName);
     }
 
@@ -70,11 +89,11 @@ final class ToolExecutor {
 
         Intent launcherIntent = new Intent(Intent.ACTION_MAIN);
         launcherIntent.addCategory(Intent.CATEGORY_LAUNCHER);
-        List<ResolveInfo> candidates = appContext.getPackageManager().queryIntentActivities(launcherIntent, 0);
+        List<ResolveInfo> candidates = packageManager.queryIntentActivities(launcherIntent, 0);
 
         String containsMatch = null;
         for (ResolveInfo candidate : candidates) {
-            CharSequence label = candidate.loadLabel(appContext.getPackageManager());
+            CharSequence label = candidate.loadLabel(packageManager);
             String normalizedLabel = normalizeAppName(label == null ? "" : label.toString());
             String packageName = candidate.activityInfo == null ? null : candidate.activityInfo.packageName;
             if (packageName == null || packageName.isBlank()) {
@@ -110,9 +129,8 @@ final class ToolExecutor {
 
         String packageName = appAliasResolver.resolvePackage(appName != null ? appName : "音乐");
         if (packageName != null) {
-            Intent appIntent = appContext.getPackageManager().getLaunchIntentForPackage(packageName);
+            Intent appIntent = createLaunchIntent(packageName);
             if (appIntent != null) {
-                appIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                 return startActivitySafely(
                         appIntent,
                         "Opened music app for " + query,
@@ -121,10 +139,8 @@ final class ToolExecutor {
             }
         }
 
-        Intent browserIntent = new Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + Uri.encode(query)));
-        browserIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        return startActivitySafely(
-                browserIntent,
+        return openWebSearch(
+                query,
                 "Searched music for " + query,
                 "No browser available to search music for " + query
         );
@@ -160,10 +176,8 @@ final class ToolExecutor {
         if (query == null || query.isBlank()) {
             return new ToolExecutionResult(false, "web_search requires query");
         }
-        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + Uri.encode(query)));
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
-        return startActivitySafely(
-                intent,
+        return openWebSearch(
+                query,
                 "Opened web search for " + query,
                 "No browser available to search for " + query
         );
@@ -171,14 +185,21 @@ final class ToolExecutor {
 
     private ToolExecutionResult openSystemPanel(Map<String, Object> arguments) {
         String panel = readString(arguments, "panel");
+        return openSystemPanelByName(panel, "open_system_panel requires panel");
+    }
+
+    private ToolExecutionResult openSystemPanelByName(String panel, String missingMessage) {
         if (panel == null || panel.isBlank()) {
-            return new ToolExecutionResult(false, "open_system_panel requires panel");
+            return new ToolExecutionResult(false, missingMessage);
         }
-        String normalized = panel.trim().toLowerCase(Locale.ROOT);
+        String normalized = normalizeSettingsTarget(panel);
+        if (normalized == null) {
+            return new ToolExecutionResult(false, "Unsupported system panel: " + panel);
+        }
         Intent intent;
         switch (normalized) {
             case "bluetooth":
-                intent = new Intent(BluetoothAdapter.ACTION_REQUEST_ENABLE);
+                intent = new Intent(Settings.ACTION_BLUETOOTH_SETTINGS);
                 break;
             case "wifi":
                 intent = new Intent(Settings.Panel.ACTION_WIFI);
@@ -211,8 +232,34 @@ final class ToolExecutor {
         return value.trim().replace(" ", "").toLowerCase(Locale.ROOT);
     }
 
+    private static String normalizeSettingsTarget(String value) {
+        String normalized = normalizeAppName(value);
+        return switch (normalized) {
+            case "settings", "设置", "系统设置" -> "settings";
+            case "wifi", "wi-fi", "wlan", "无线网络" -> "wifi";
+            case "bluetooth", "蓝牙" -> "bluetooth";
+            case "internet", "网络", "互联网" -> "internet";
+            default -> null;
+        };
+    }
+
+    private ToolExecutionResult openWebSearch(String query, String successMessage, String failureMessage) {
+        Intent intent = new Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?q=" + Uri.encode(query)));
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        return startActivitySafely(intent, successMessage, failureMessage);
+    }
+
+    private Intent createLaunchIntent(String packageName) {
+        Intent launchIntent = packageManager.getLaunchIntentForPackage(packageName);
+        if (launchIntent == null) {
+            return null;
+        }
+        launchIntent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
+        return launchIntent;
+    }
+
     private ToolExecutionResult startActivitySafely(Intent intent, String successMessage, String failureMessage) {
-        if (intent.resolveActivity(appContext.getPackageManager()) == null) {
+        if (intent.resolveActivity(packageManager) == null) {
             return new ToolExecutionResult(false, failureMessage);
         }
         try {

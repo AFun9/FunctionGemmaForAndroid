@@ -19,7 +19,6 @@
     <string name="button_save_app_alias">Save App Mapping</string>
     <string name="button_run">Run Inference</string>
     <string name="button_running">Running…</string>
-    <string name="button_execute_tool">Execute Parsed Tool</string>
     <string name="label_toolset">Toolset</string>
     <string name="label_cache_status">Prefix Cache Status</string>
     <string name="label_cache_status_compact">Prefix Cache</string>

@@ -40,17 +40,14 @@ static const uint32_t KV_CACHE_VERSION = 1;
 
 class GemmaInferenceImpl {
 private:
-    using PastType = float;  // FP32 - 移动端性能最优
-    // 根据PastType自动确定ONNX张量元素类型
-    static constexpr ONNXTensorElementDataType PAST_ELEMENT_TYPE =
-            // 仅支持FP16和FP32两种类型
-            ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT;
-
     // ONNX Runtime 相关
     std::unique_ptr<Ort::Env> ortEnv;
     std::unique_ptr<Ort::Session> ortSession;
     Ort::SessionOptions sessionOptions;
     Ort::MemoryInfo memoryInfo;
+
+    ONNXTensorElementDataType kvElementType;
+    size_t kvBytesPerElement;
 
     // 输入输出名称
     std::vector<const char*> inputNames;
@@ -63,22 +60,22 @@ private:
         static constexpr size_t MAX_SEQ_LEN = 2048;     // 支持更长的序列
         static constexpr size_t NUM_BUFFERS = 2;        // 双缓冲区
 
+        size_t bytes_per_element;
+
         // 三维数组设计：[buffer_index][seq_pos * HEAD_DIM]
         // past_key_values[0][...] 作为 past_1, past_key_values[1][...] 作为 past_2
-        std::vector<PastType> key_buffers;   // 自动选择FP16或FP32
-        std::vector<PastType> value_buffers; // 自动选择FP16或FP32
+        std::vector<uint8_t> key_buffers;
+        std::vector<uint8_t> value_buffers;
         size_t current_seq_len;  // 当前有效序列长度
         size_t current_buffer;   // 当前使用的缓冲区索引 (0 或 1)
 
-        KVCache() : current_seq_len(0), current_buffer(0) {
+        explicit KVCache(size_t bytesPerElement = sizeof(float))
+                : bytes_per_element(bytesPerElement), current_seq_len(0), current_buffer(0) {
             // 预分配最大缓冲区大小的双缓冲区
-            size_t single_buffer_size = MAX_SEQ_LEN * HEAD_DIM;
+            size_t single_buffer_size = MAX_SEQ_LEN * HEAD_DIM * bytes_per_element;
             size_t total_buffer_size = NUM_BUFFERS * single_buffer_size;
-
-            // 自动初始化为正确的类型和值
-            PastType zero_value = static_cast<PastType>(0.0f);
-            key_buffers.resize(total_buffer_size, zero_value);
-            value_buffers.resize(total_buffer_size, zero_value);
+            key_buffers.resize(total_buffer_size, 0);
+            value_buffers.resize(total_buffer_size, 0);
         }
 
         size_t seq_len() const {
@@ -121,21 +118,21 @@ private:
 
     public:
         // 获取指定缓冲区的数据指针（三维数组访问：past[buffer_idx][...]）
-        PastType* key_buffer_data(size_t buffer_idx) {
+        void* key_buffer_data(size_t buffer_idx) {
             return key_buffers.data() + buffer_idx * (key_buffers.size() / NUM_BUFFERS);
         }
-        PastType* value_buffer_data(size_t buffer_idx) {
+        void* value_buffer_data(size_t buffer_idx) {
             return value_buffers.data() + buffer_idx * (value_buffers.size() / NUM_BUFFERS);
         }
 
-        size_t key_size() const { return current_seq_len * HEAD_DIM; }
-        size_t value_size() const { return current_seq_len * HEAD_DIM; }
+        size_t key_size_bytes() const { return current_seq_len * HEAD_DIM * bytes_per_element; }
+        size_t value_size_bytes() const { return current_seq_len * HEAD_DIM * bytes_per_element; }
     };
 
     std::vector<KVCache> kvCache;
 
     // 系统KV cache存储（用于分阶段prefill优化）
-    std::vector<std::vector<PastType>> systemKVCache;  // [layer][seq_len * head_dim]
+    std::vector<std::vector<uint8_t>> systemKVCache;  // [layer][raw key bytes + raw value bytes]
     size_t systemSeqLength;  // 系统提示词的序列长度
     bool systemCacheValid;   // 系统缓存是否有效
 
@@ -152,10 +149,11 @@ private:
 public:
     GemmaInferenceImpl()
             : memoryInfo(Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault)),
+              kvElementType(ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT),
+              kvBytesPerElement(sizeof(float)),
               currentAttentionMaskSize(0),
               currentInputBufferIndex(0) {
         initNames();
-        initKVCache();
         // 初始化系统KV cache状态
         systemSeqLength = 0;
         systemCacheValid = false;
@@ -179,9 +177,20 @@ public:
             sessionOptions.SetIntraOpNumThreads(numThreads);
             sessionOptions.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
             sessionOptions.SetExecutionMode(ExecutionMode::ORT_SEQUENTIAL);
+            // On mobile, ORT's CPU arena can amplify peak RSS for fp16-style graphs.
+            // Our benchmarks show disabling it significantly reduces peak memory
+            // without changing generated outputs for this workload.
+            sessionOptions.DisableCpuMemArena();
 
             // 创建会话
             ortSession = std::make_unique<Ort::Session>(*ortEnv, modelPath.c_str(), sessionOptions);
+            if (!detectKvCacheType()) {
+                return false;
+            }
+            initKVCache();
+            LOGI("Detected KV cache dtype: %s (%zu bytes/element)",
+                 kvElementType == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16 ? "fp16" : "fp32",
+                 kvBytesPerElement);
 
             return true;
         } catch (const Ort::Exception& e) {
@@ -237,16 +246,15 @@ public:
                 const auto& valueOutput = outputs[2 + layer * 2]; // 然后是value outputs
 
                 // 获取tensor数据
-                const PastType* keyData = keyOutput.GetTensorData<PastType>();
-                const PastType* valueData = valueOutput.GetTensorData<PastType>();
+                const void* keyData = keyOutput.GetTensorRawData();
+                const void* valueData = valueOutput.GetTensorRawData();
 
-                // 计算数据大小：seq_len * head_dim
                 size_t dataSize = systemSeqLength * HEAD_DIM;
+                size_t byteCount = kvBytesForElements(dataSize);
 
-                // 存储到系统缓存中
-                systemKVCache[layer].resize(dataSize * 2); // key + value
-                std::copy(keyData, keyData + dataSize, systemKVCache[layer].begin());
-                std::copy(valueData, valueData + dataSize, systemKVCache[layer].begin() + dataSize);
+                systemKVCache[layer].resize(byteCount * 2);
+                std::memcpy(systemKVCache[layer].data(), keyData, byteCount);
+                std::memcpy(systemKVCache[layer].data() + byteCount, valueData, byteCount);
             }
 
             systemCacheValid = true;
@@ -276,7 +284,7 @@ public:
         const uint32_t numLayers = NUM_LAYERS;
         const uint32_t headDim = HEAD_DIM;
         const uint64_t seqLen = systemSeqLength;
-        const uint32_t bytesPerElement = sizeof(PastType);
+            const uint32_t bytesPerElement = static_cast<uint32_t>(kvBytesPerElement);
 
         stream.write(reinterpret_cast<const char*>(&KV_CACHE_MAGIC), sizeof(KV_CACHE_MAGIC));
         stream.write(reinterpret_cast<const char*>(&KV_CACHE_VERSION), sizeof(KV_CACHE_VERSION));
@@ -286,7 +294,7 @@ public:
         stream.write(reinterpret_cast<const char*>(&seqLen), sizeof(seqLen));
 
         for (const auto& layerBuffer : systemKVCache) {
-            const size_t byteCount = layerBuffer.size() * sizeof(PastType);
+            const size_t byteCount = layerBuffer.size();
             stream.write(reinterpret_cast<const char*>(layerBuffer.data()), static_cast<std::streamsize>(byteCount));
         }
 
@@ -326,16 +334,16 @@ public:
             LOGE("KV cache header mismatch");
             return false;
         }
-        if (numLayers != NUM_LAYERS || headDim != HEAD_DIM || bytesPerElement != sizeof(PastType) || seqLen == 0) {
+        if (numLayers != NUM_LAYERS || headDim != HEAD_DIM || bytesPerElement != kvBytesPerElement || seqLen == 0) {
             LOGE("KV cache shape mismatch");
             return false;
         }
 
-        const size_t layerElementCount = static_cast<size_t>(seqLen) * HEAD_DIM * 2;
-        std::vector<std::vector<PastType>> loadedCache(NUM_LAYERS);
+        const size_t layerByteCount = kvBytesForElements(static_cast<size_t>(seqLen) * HEAD_DIM) * 2;
+        std::vector<std::vector<uint8_t>> loadedCache(NUM_LAYERS);
         for (auto& layerBuffer : loadedCache) {
-            layerBuffer.resize(layerElementCount);
-            const size_t byteCount = layerBuffer.size() * sizeof(PastType);
+            layerBuffer.resize(layerByteCount);
+            const size_t byteCount = layerBuffer.size();
             stream.read(reinterpret_cast<char*>(layerBuffer.data()), static_cast<std::streamsize>(byteCount));
             if (!stream.good()) {
                 LOGE("Failed to read KV cache payload");
@@ -619,7 +627,11 @@ private:
 
     // 初始化 KV cache
     void initKVCache() {
-        kvCache.resize(NUM_LAYERS);  // 构造函数自动推断类型
+        kvCache.clear();
+        kvCache.reserve(NUM_LAYERS);
+        for (int i = 0; i < NUM_LAYERS; ++i) {
+            kvCache.emplace_back(kvBytesPerElement);
+        }
     }
 
 
@@ -651,11 +663,11 @@ private:
         for (int i = 0; i < NUM_LAYERS; ++i) {
             // Key (空tensor)
             inputs.push_back(Ort::Value::CreateTensor(memoryInfo, nullptr, 0, emptyKvShape.data(), emptyKvShape.size(),
-                                                      PAST_ELEMENT_TYPE));
+                                                      kvElementType));
 
             // Value (空tensor)
             inputs.push_back(Ort::Value::CreateTensor(memoryInfo, nullptr, 0, emptyKvShape.data(), emptyKvShape.size(),
-                                                      PAST_ELEMENT_TYPE));
+                                                      kvElementType));
         }
 
         // 4. attention_mask
@@ -678,13 +690,13 @@ private:
             // 预绑定缓冲区：让ONNX直接写入我们的缓冲区（零拷贝）
             // 注意：虽然缓冲区很大，但我们只告诉ONNX实际需要的大小
             outputs.push_back(Ort::Value::CreateTensor(memoryInfo, kvCache[i].key_buffer_data(outputBufferIndex),
-                                                       required_elements * sizeof(PastType),
+                                                       kvBytesForElements(required_elements),
                                                        kvShape.data(), kvShape.size(),
-                                                       PAST_ELEMENT_TYPE));
+                                                       kvElementType));
             outputs.push_back(Ort::Value::CreateTensor(memoryInfo, kvCache[i].value_buffer_data(outputBufferIndex),
-                                                       required_elements * sizeof(PastType),
+                                                       kvBytesForElements(required_elements),
                                                        kvShape.data(), kvShape.size(),
-                                                       PAST_ELEMENT_TYPE));
+                                                       kvElementType));
         }
     }
 
@@ -718,14 +730,15 @@ private:
             size_t dataSize = systemSeqLength * HEAD_DIM;
 
             // Key - 使用系统缓存
-            inputs.push_back(Ort::Value::CreateTensor<PastType>(
-                    memoryInfo, systemKVCache[i].data(), dataSize,
-                    systemKvShape.data(), systemKvShape.size()));
+            size_t byteCount = kvBytesForElements(dataSize);
+            inputs.push_back(Ort::Value::CreateTensor(
+                    memoryInfo, systemKVCache[i].data(), byteCount,
+                    systemKvShape.data(), systemKvShape.size(), kvElementType));
 
             // Value - 使用系统缓存（在key之后）
-            inputs.push_back(Ort::Value::CreateTensor<PastType>(
-                    memoryInfo, systemKVCache[i].data() + dataSize, dataSize,
-                    systemKvShape.data(), systemKvShape.size()));
+            inputs.push_back(Ort::Value::CreateTensor(
+                    memoryInfo, systemKVCache[i].data() + byteCount, byteCount,
+                    systemKvShape.data(), systemKvShape.size(), kvElementType));
         }
 
         // 4. attention_mask - 覆盖完整上下文（系统 + 用户）
@@ -746,11 +759,11 @@ private:
             size_t required_elements = totalContextLen * HEAD_DIM;
 
             outputs.push_back(Ort::Value::CreateTensor(memoryInfo, kvCache[i].key_buffer_data(outputBufferIndex),
-                                                       required_elements * sizeof(PastType),
-                                                       outputKvShape.data(), outputKvShape.size(), PAST_ELEMENT_TYPE));
+                                                       kvBytesForElements(required_elements),
+                                                       outputKvShape.data(), outputKvShape.size(), kvElementType));
             outputs.push_back(Ort::Value::CreateTensor(memoryInfo, kvCache[i].value_buffer_data(outputBufferIndex),
-                                                       required_elements * sizeof(PastType),
-                                                       outputKvShape.data(), outputKvShape.size(), PAST_ELEMENT_TYPE));
+                                                       kvBytesForElements(required_elements),
+                                                       outputKvShape.data(), outputKvShape.size(), kvElementType));
         }
     }
 
@@ -785,15 +798,15 @@ private:
         for (int i = 0; i < NUM_LAYERS; ++i) {
             // Key - 使用当前输入缓冲区
             inputs.push_back(Ort::Value::CreateTensor(memoryInfo, kvCache[i].key_buffer_data(currentInputBufferIndex),
-                                                      kvCache[i].key_size() * sizeof(PastType),
+                                                      kvCache[i].key_size_bytes(),
                                                       kvShape.data(), kvShape.size(),
-                                                      PAST_ELEMENT_TYPE));
+                                                      kvElementType));
 
             // Value - 使用当前输入缓冲区
             inputs.push_back(Ort::Value::CreateTensor(memoryInfo, kvCache[i].value_buffer_data(currentInputBufferIndex),
-                                                      kvCache[i].value_size() * sizeof(PastType),
+                                                      kvCache[i].value_size_bytes(),
                                                       kvShape.data(), kvShape.size(),
-                                                      PAST_ELEMENT_TYPE));
+                                                      kvElementType));
         }
 
         // 4. attention_mask
@@ -816,13 +829,13 @@ private:
             // 预绑定缓冲区：让ONNX直接写入我们的缓冲区（零拷贝）
             // 注意：虽然缓冲区很大，但我们只告诉ONNX实际需要的大小
             outputs.push_back(Ort::Value::CreateTensor(memoryInfo, kvCache[i].key_buffer_data(outputBufferIndex),
-                                                       required_elements * sizeof(PastType),
+                                                       kvBytesForElements(required_elements),
                                                        outputKvShape.data(), outputKvShape.size(),
-                                                       PAST_ELEMENT_TYPE));
+                                                       kvElementType));
             outputs.push_back(Ort::Value::CreateTensor(memoryInfo, kvCache[i].value_buffer_data(outputBufferIndex),
-                                                       required_elements * sizeof(PastType),
+                                                       kvBytesForElements(required_elements),
                                                        outputKvShape.data(), outputKvShape.size(),
-                                                       PAST_ELEMENT_TYPE));
+                                                       kvElementType));
         }
     }
 
@@ -903,6 +916,71 @@ private:
     // 辅助函数：检查是否包含停止 token
     bool contains(const std::vector<int>& vec, int value) {
         return std::find(vec.begin(), vec.end(), value) != vec.end();
+    }
+
+    bool detectKvCacheType() {
+        if (!ortSession) {
+            LOGE("ONNX session not initialized when detecting KV cache type");
+            return false;
+        }
+        Ort::AllocatorWithDefaultOptions allocator;
+        auto findInputIndex = [&](const char* targetName) -> int {
+            const size_t inputCount = ortSession->GetInputCount();
+            for (size_t i = 0; i < inputCount; ++i) {
+                auto name = ortSession->GetInputNameAllocated(i, allocator);
+                if (name && std::strcmp(name.get(), targetName) == 0) {
+                    return static_cast<int>(i);
+                }
+            }
+            return -1;
+        };
+        auto findOutputIndex = [&](const char* targetName) -> int {
+            const size_t outputCount = ortSession->GetOutputCount();
+            for (size_t i = 0; i < outputCount; ++i) {
+                auto name = ortSession->GetOutputNameAllocated(i, allocator);
+                if (name && std::strcmp(name.get(), targetName) == 0) {
+                    return static_cast<int>(i);
+                }
+            }
+            return -1;
+        };
+
+        const int inputIndex = findInputIndex("past_key_values.0.key");
+        const int outputIndex = findOutputIndex("present.0.key");
+        if (inputIndex < 0 || outputIndex < 0) {
+            LOGE("Failed to find KV cache I/O names in model graph (input=%d, output=%d)",
+                 inputIndex, outputIndex);
+            return false;
+        }
+
+        auto inputTypeInfo = ortSession->GetInputTypeInfo(static_cast<size_t>(inputIndex));
+        auto outputTypeInfo = ortSession->GetOutputTypeInfo(static_cast<size_t>(outputIndex));
+        auto inputInfo = inputTypeInfo.GetTensorTypeAndShapeInfo();
+        auto outputInfo = outputTypeInfo.GetTensorTypeAndShapeInfo();
+        auto inputType = inputInfo.GetElementType();
+        auto outputType = outputInfo.GetElementType();
+        if (inputType != outputType) {
+            LOGE("KV cache dtype mismatch between input %d (%d) and output %d (%d)",
+                 inputIndex, inputType, outputIndex, outputType);
+            return false;
+        }
+        switch (inputType) {
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT:
+                kvElementType = inputType;
+                kvBytesPerElement = sizeof(float);
+                return true;
+            case ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16:
+                kvElementType = inputType;
+                kvBytesPerElement = sizeof(Ort::Float16_t);
+                return true;
+            default:
+                LOGE("Unsupported KV cache dtype: %d", inputType);
+                return false;
+        }
+    }
+
+    size_t kvBytesForElements(size_t elementCount) const {
+        return elementCount * kvBytesPerElement;
     }
 };
 

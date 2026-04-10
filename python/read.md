@@ -20,12 +20,10 @@ The conversion logic is based on the official Gemma export approach, but this pr
 
 ## Precision Export vs Runtime Support
 
-The conversion script supports multiple export precisions, including:
+The conversion script in this repository currently supports two export precisions:
 
 - `fp32`
 - `fp16`
-- `q4`
-- `q4f16`
 
 However, export support should not be confused with complete runtime support.
 
@@ -91,7 +89,7 @@ A typical conversion command may look like this:
 python build_gemma.py \
     --model_name "your-org/your-gemma-model" \
     --output "/path/to/output/model-onnx" \
-    -p fp32 fp16 q4 q4f16
+    -p fp32 fp16
 ```
 
 Adjust the model identifier and output path according to your own environment and model source.

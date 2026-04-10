@@ -1,6 +1,5 @@
 package com.gemma.functiongemma.android;
 
-import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -17,25 +16,27 @@ final class BuiltInToolsets {
                                 "Mobile Assistant",
                                 "You are a mobile assistant with tool calling. ",
                                 List.of(
-                                                launchAppTool(),
+                                                openTargetTool(),
                                                 navigateTool(),
                                                 playMusicTool(),
-                                                webSearchTool(),
-                                                openSystemPanelTool()));
+                                                webSearchTool()));
         }
 
-        private static Map<String, Object> launchAppTool() {
+        private static Map<String, Object> openTargetTool() {
+                Map<String, Object> parameters = properties(
+                                property("target", "string",
+                                                "Copy the exact target text from the user's request after 打开. Keep the original text as-is. Do not translate, paraphrase, romanize, or normalize it."));
+                parameters.put("required", List.of("target"));
                 return functionTool(
-                                "launch_app",
-                                "Open an app itself. Do not use this for navigation, music playback, web search, or system settings.",
-                                properties(
-                                                property("app_name", "string", "App name")));
+                                "open_target",
+                                "Open an app or a system settings page. Copy the exact target text from the user's request into target.",
+                                parameters);
         }
 
         private static Map<String, Object> playMusicTool() {
                 return functionTool(
                                 "play_music",
-                                "Play or search music. If both artist and song appear, extract them separately. Prefer this over launch_app for music requests.",
+                                "Play or search music. Do not use this just to open a music app.",
                                 properties(
                                                 property("song", "string", "Song title"),
                                                 property("artist", "string", "Artist name"),
@@ -43,30 +44,25 @@ final class BuiltInToolsets {
         }
 
         private static Map<String, Object> navigateTool() {
+                Map<String, Object> parameters = properties(
+                                property("destination", "string", "Destination name or address"),
+                                property("mode", "string",
+                                                "Optional mode such as driving, walking, transit"));
+                parameters.put("required", List.of("destination"));
                 return functionTool(
                                 "navigate",
-                                "Navigate to a destination. The default map app is 高德地图.",
-                                properties(
-                                                property("destination", "string", "Destination name or address"),
-                                                property("mode", "string",
-                                                                "Optional mode such as driving, walking, transit")));
+                                "Navigate to a destination in the map app.",
+                                parameters);
         }
 
         private static Map<String, Object> webSearchTool() {
+                Map<String, Object> parameters = properties(
+                                property("query", "string", "Search query"));
+                parameters.put("required", List.of("query"));
                 return functionTool(
                                 "web_search",
-                                "Search the web.",
-                                properties(
-                                                property("query", "string", "Search query")));
-        }
-
-        private static Map<String, Object> openSystemPanelTool() {
-                Map<String, Object> panel = property("panel", "string", "Panel name");
-                panel.put("enum", Arrays.asList("bluetooth", "wifi", "internet", "settings"));
-                return functionTool(
-                                "open_system_panel",
-                                "Open a system panel such as bluetooth, wifi, internet, or settings.",
-                                properties(panel));
+                                "Search the web in a browser.",
+                                parameters);
         }
 
         private static Map<String, Object> functionTool(String name, String description,

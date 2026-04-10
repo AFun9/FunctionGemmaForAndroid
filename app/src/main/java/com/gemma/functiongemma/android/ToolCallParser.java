@@ -46,47 +46,29 @@ final class ToolCallParser {
 
         try {
             String trimmed = rawText.trim();
-            Matcher taggedMatcher = TAGGED_JSON_PATTERN.matcher(trimmed);
-            if (taggedMatcher.find()) {
-                return parseJsonCall(taggedMatcher.group(1));
+            ToolCall parsed = tryParseJsonMatch(trimmed, TAGGED_JSON_PATTERN);
+            if (parsed != null) {
+                return parsed;
             }
 
-            Matcher openTaggedMatcher = OPEN_TAGGED_JSON_PATTERN.matcher(trimmed);
-            if (openTaggedMatcher.find()) {
-                ToolCall openTaggedCall = parseJsonCall(openTaggedMatcher.group(1));
-                if (openTaggedCall != null) {
-                    return openTaggedCall;
-                }
+            parsed = tryParseJsonMatch(trimmed, OPEN_TAGGED_JSON_PATTERN);
+            if (parsed != null) {
+                return parsed;
             }
 
-            Matcher fencedMatcher = FENCED_JSON_PATTERN.matcher(trimmed);
-            if (fencedMatcher.find()) {
-                ToolCall fencedCall = parseJsonCall(fencedMatcher.group(1));
-                if (fencedCall != null) {
-                    return fencedCall;
-                }
+            parsed = tryParseJsonMatch(trimmed, FENCED_JSON_PATTERN);
+            if (parsed != null) {
+                return parsed;
             }
 
-            Matcher templateMatcher = TEMPLATE_CALL_PATTERN.matcher(trimmed);
-            if (templateMatcher.find()) {
-                ToolCall templateCall = parseTemplateCall(
-                        templateMatcher.group(1),
-                        templateMatcher.group(2)
-                );
-                if (templateCall != null) {
-                    return templateCall;
-                }
+            parsed = tryParseTemplateMatch(trimmed, TEMPLATE_CALL_PATTERN);
+            if (parsed != null) {
+                return parsed;
             }
 
-            Matcher openTemplateMatcher = OPEN_TEMPLATE_CALL_PATTERN.matcher(trimmed);
-            if (openTemplateMatcher.find()) {
-                ToolCall templateCall = parseTemplateCall(
-                        openTemplateMatcher.group(1),
-                        openTemplateMatcher.group(2)
-                );
-                if (templateCall != null) {
-                    return templateCall;
-                }
+            parsed = tryParseTemplateMatch(trimmed, OPEN_TEMPLATE_CALL_PATTERN);
+            if (parsed != null) {
+                return parsed;
             }
 
             if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
@@ -114,6 +96,22 @@ final class ToolCallParser {
         } catch (RuntimeException error) {
             return null;
         }
+    }
+
+    private static ToolCall tryParseJsonMatch(String text, Pattern pattern) {
+        Matcher matcher = pattern.matcher(text);
+        if (!matcher.find()) {
+            return null;
+        }
+        return parseJsonCall(matcher.group(1));
+    }
+
+    private static ToolCall tryParseTemplateMatch(String text, Pattern pattern) {
+        Matcher matcher = pattern.matcher(text);
+        if (!matcher.find()) {
+            return null;
+        }
+        return parseTemplateCall(matcher.group(1), matcher.group(2));
     }
 
     private static ToolCall parseEmbeddedJsonCall(String text) {
@@ -243,22 +241,18 @@ final class ToolCallParser {
         if (name == null) {
             return null;
         }
+        return new ToolCall(name, readArguments(object));
+    }
 
-        Map<String, Object> arguments = new LinkedHashMap<>();
-        if (object.has("arguments") && object.get("arguments").isJsonObject()) {
-            @SuppressWarnings("unchecked")
-            Map<String, Object> parsedArgs = GSON.fromJson(object.get("arguments"), Map.class);
-            arguments.putAll(parsedArgs);
-        } else if (object.has("args") && object.get("args").isJsonObject()) {
-            @SuppressWarnings("unchecked")
-            Map<String, Object> parsedArgs = GSON.fromJson(object.get("args"), Map.class);
-            arguments.putAll(parsedArgs);
-        } else if (object.has("parameters") && object.get("parameters").isJsonObject()) {
-            @SuppressWarnings("unchecked")
-            Map<String, Object> parsedArgs = GSON.fromJson(object.get("parameters"), Map.class);
-            arguments.putAll(parsedArgs);
+    private static Map<String, Object> readArguments(JsonObject object) {
+        for (String key : new String[]{"arguments", "args", "parameters"}) {
+            if (object.has(key) && object.get(key).isJsonObject()) {
+                @SuppressWarnings("unchecked")
+                Map<String, Object> parsedArgs = GSON.fromJson(object.get(key), Map.class);
+                return parsedArgs;
+            }
         }
-        return new ToolCall(name, arguments);
+        return new LinkedHashMap<>();
     }
 
     private static String readString(JsonObject object, String key) {

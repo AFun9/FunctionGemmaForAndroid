@@ -10,7 +10,6 @@ import com.gemma.functiongemma.Tokenizer;
 import java.io.File;
 import java.io.IOException;
 import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -48,7 +47,6 @@ public final class FunctionGemmaEngine implements AutoCloseable {
     private String tokenizerSignature;
     private String activeToolsetId;
     private String activeFingerprint;
-    private boolean lastActivationUsedPersistedCache;
     private PrefixCacheStatus activeCacheStatus;
     private boolean loaded;
 
@@ -60,13 +58,9 @@ public final class FunctionGemmaEngine implements AutoCloseable {
         this.appContext = context.getApplicationContext();
         this.inferenceEngine = new CppInferenceEngine();
         this.toolsetStore = new ToolsetStore(appContext.getNoBackupFilesDir());
-        registerOrReplaceToolsetInternal(createDefaultToolset(), false);
+        registerOrReplaceToolsetInternal(BuiltInToolsets.createMobileAssistantToolset(), false);
         loadPersistedToolsets();
         this.activeToolsetId = DEFAULT_TOOLSET_ID;
-    }
-
-    public synchronized void load() throws Exception {
-        load(null);
     }
 
     public synchronized void load(StatusListener statusListener) throws Exception {
@@ -76,7 +70,7 @@ public final class FunctionGemmaEngine implements AutoCloseable {
         }
         long startTime = System.currentTimeMillis();
         notifyStatus(statusListener, "Status: extracting model assets...");
-        extractedDir = AssetModelManager.ensureExtracted(appContext);
+        extractedDir = AssetModelManager.ensureExtracted(appContext, status -> notifyStatus(statusListener, status));
         notifyStatus(statusListener, "Status: preparing prefix cache directory...");
         prefixCacheDir = new File(appContext.getNoBackupFilesDir(), CACHE_DIR_NAME);
         if (!prefixCacheDir.exists() && !prefixCacheDir.mkdirs()) {
@@ -107,34 +101,24 @@ public final class FunctionGemmaEngine implements AutoCloseable {
         registerOrReplaceToolsetInternal(toolset, true);
     }
 
-    public synchronized ToolsetDefinition registerOrReplaceToolset(
-            String toolsetId,
-            String displayName,
-            String systemPrompt,
-            List<Map<String, Object>> tools) {
-        ToolsetDefinition toolset = new ToolsetDefinition(toolsetId, displayName, systemPrompt, tools);
-        registerOrReplaceToolset(toolset);
-        return toolset;
-    }
-
     public synchronized List<String> getRegisteredToolsetIds() {
         return new ArrayList<>(toolsets.keySet());
     }
 
     public synchronized ToolsetDefinition getToolset(String toolsetId) {
         ToolsetDefinition toolset = toolsets.get(toolsetId);
-        if (toolset == null) {
-            return null;
-        }
-        return new ToolsetDefinition(toolset.id(), toolset.displayName(), toolset.systemPrompt(), toolset.tools());
+        return toolset == null
+                ? null
+                : new ToolsetDefinition(
+                        toolset.id(),
+                        toolset.displayName(),
+                        toolset.systemPrompt(),
+                        toolset.tools()
+                );
     }
 
     public synchronized String getActiveToolsetId() {
         return activeToolsetId;
-    }
-
-    public synchronized boolean wasLastActivationCacheHit() {
-        return lastActivationUsedPersistedCache;
     }
 
     public synchronized PrefixCacheStatus getActiveToolsetCacheStatus() {
@@ -142,13 +126,10 @@ public final class FunctionGemmaEngine implements AutoCloseable {
     }
 
     public synchronized void activateToolset(String toolsetId) throws Exception {
-        ToolsetDefinition toolset = toolsets.get(toolsetId);
-        if (toolset == null) {
-            throw new IllegalArgumentException("Unknown toolset: " + toolsetId);
-        }
+        ToolsetDefinition toolset = requireToolset(toolsetId);
         if (!loaded) {
             activeToolsetId = toolsetId;
-            load();
+            ensureLoaded();
             return;
         }
         ensurePrefixCacheReady(toolset, false);
@@ -182,29 +163,15 @@ public final class FunctionGemmaEngine implements AutoCloseable {
     }
 
     public synchronized void rebuildToolsetCache(String toolsetId) throws Exception {
-        ToolsetDefinition toolset = toolsets.get(toolsetId);
-        if (toolset == null) {
-            throw new IllegalArgumentException("Unknown toolset: " + toolsetId);
-        }
-        if (!loaded) {
-            load();
-        }
+        ToolsetDefinition toolset = requireToolset(toolsetId);
+        ensureLoaded();
         ensurePrefixCacheReady(toolset, true);
         activeToolsetId = toolsetId;
     }
 
-    public synchronized String generate(String userMessage, int maxNewTokens) throws Exception {
-        return generate(activeToolsetId, userMessage, maxNewTokens);
-    }
-
     public synchronized String generate(String toolsetId, String userMessage, int maxNewTokens) throws Exception {
-        if (!loaded) {
-            load();
-        }
-        ToolsetDefinition toolset = toolsets.get(toolsetId);
-        if (toolset == null) {
-            throw new IllegalArgumentException("Unknown toolset: " + toolsetId);
-        }
+        ensureLoaded();
+        ToolsetDefinition toolset = requireToolset(toolsetId);
         ensurePrefixCacheReady(toolset, false);
 
         List<Map<String, Object>> messages = new ArrayList<>();
@@ -232,7 +199,6 @@ public final class FunctionGemmaEngine implements AutoCloseable {
                 && fingerprint.equals(activeFingerprint)
                 && toolset.id().equals(activeToolsetId)
                 && inferenceEngine.getSystemPrefixSequenceLength() == prefixTokens.length) {
-            lastActivationUsedPersistedCache = true;
             return;
         }
 
@@ -244,7 +210,6 @@ public final class FunctionGemmaEngine implements AutoCloseable {
                     && inferenceEngine.getSystemPrefixSequenceLength() == prefixTokens.length) {
                 activeToolsetId = toolset.id();
                 activeFingerprint = fingerprint;
-                lastActivationUsedPersistedCache = true;
                 activeCacheStatus = buildCacheStatus(toolset.id(), entry, true);
                 return;
             }
@@ -274,15 +239,24 @@ public final class FunctionGemmaEngine implements AutoCloseable {
 
         activeToolsetId = toolset.id();
         activeFingerprint = fingerprint;
-        lastActivationUsedPersistedCache = false;
         activeCacheStatus = buildCacheStatus(toolset.id(), newEntry, false);
     }
 
     private static void notifyStatus(StatusListener listener, String status) {
         Log.d(TAG, status);
-        if (listener != null) {
-            listener.onStatus(status);
+        if (listener != null) listener.onStatus(status);
+    }
+
+    private void ensureLoaded() throws Exception {
+        if (!loaded) load(null);
+    }
+
+    private ToolsetDefinition requireToolset(String toolsetId) {
+        ToolsetDefinition toolset = toolsets.get(toolsetId);
+        if (toolset == null) {
+            throw new IllegalArgumentException("Unknown toolset: " + toolsetId);
         }
+        return toolset;
     }
 
     private long[] buildPrefixTokens(ToolsetDefinition toolset) {
@@ -295,11 +269,12 @@ public final class FunctionGemmaEngine implements AutoCloseable {
         StringBuilder builder = new StringBuilder();
         for (String relativePath : relativePaths) {
             File file = new File(baseDir, relativePath);
+            boolean exists = file.exists();
             builder.append(relativePath)
                     .append(':')
-                    .append(file.exists() ? file.length() : -1L)
+                    .append(exists ? file.length() : -1L)
                     .append(':')
-                    .append(file.exists() ? file.lastModified() : -1L)
+                    .append(exists ? file.lastModified() : -1L)
                     .append(';');
         }
         return builder.toString();
@@ -326,10 +301,6 @@ public final class FunctionGemmaEngine implements AutoCloseable {
         message.put("role", role);
         message.put("content", content);
         return message;
-    }
-
-    private static ToolsetDefinition createDefaultToolset() {
-        return BuiltInToolsets.createMobileAssistantToolset();
     }
 
     private void registerOrReplaceToolsetInternal(ToolsetDefinition toolset, boolean persist) {
@@ -389,12 +360,13 @@ public final class FunctionGemmaEngine implements AutoCloseable {
 
     private PrefixCacheStatus buildCacheStatus(String toolsetId, PrefixCacheEntry entry, boolean cacheHit) {
         File cacheFile = new File(prefixCacheDir, entry.kvFileName);
+        boolean exists = cacheFile.exists();
         return new PrefixCacheStatus(
                 toolsetId,
-                cacheFile.exists(),
+                exists,
                 cacheHit,
                 entry.systemSequenceLength,
-                cacheFile.exists() ? cacheFile.length() : 0L,
+                exists ? cacheFile.length() : 0L,
                 entry.createdAtEpochMs
         );
     }

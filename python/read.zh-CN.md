@@ -20,12 +20,10 @@ English version: [read.md](read.md)
 
 ## 导出精度与运行时支持的区别
 
-当前转换脚本支持导出多种精度，包括：
+当前仓库中的转换脚本只保留两种导出精度：
 
 - `fp32`
 - `fp16`
-- `q4`
-- `q4f16`
 
 但“能够导出”并不等于“运行时已经完整支持”。
 
@@ -91,7 +89,7 @@ last_logits_shape = ["batch_size", 1, "vocab_size"]
 python build_gemma.py \
     --model_name "your-org/your-gemma-model" \
     --output "/path/to/output/model-onnx" \
-    -p fp32 fp16 q4 q4f16
+    -p fp32 fp16
 ```
 
 其中模型标识与输出目录需要根据你的本地环境和模型来源自行调整。

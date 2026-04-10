@@ -1,32 +1,171 @@
+import argparse
 import ast
+import json
 import os
-from typing import Any, Callable, Optional, Sequence, Union
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Callable, Optional, Sequence, Union
 
 import numpy as np
 import onnx_ir as ir
 import torch
 from onnx_ir.serde import serialize_model
 from onnx_ir.tensor_adapters import to_torch_dtype, TorchTensor
-from onnxruntime.quantization.matmul_nbits_quantizer import (
-    MatMulNBitsQuantizer,
-    QuantFormat,
-)
 import onnx
-from transformers import AutoConfig, AutoModelForCausalLM, PretrainedConfig
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, GenerationConfig, PretrainedConfig
 
 
-SUPPORTED_PRECISIONS = ["q4f16", "q4", "fp16", "fp32"]
+SUPPORTED_PRECISIONS = ["fp16", "fp32"]
+SUPPORTED_LAYERNORM_POLICIES = ["fp32", "io"]
+SUPPORTED_LM_HEAD_POLICIES = ["full_logits", "last_token", "chunked_argmax"]
+SUPPORTED_LM_HEAD_DTYPES = ["io", "fp32"]
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
+
+    parser.add_argument(
+        "-m",
+        "--model_name",
+        required=True,
+        help="Model name in Hugging Face. Do not use if providing an input path to a Hugging Face directory in -i/--input.",
+    )
+    parser.add_argument(
+        "-o",
+        "--output",
+        required=True,
+        help="Path to folder to store generated files",
+    )
+    parser.add_argument(
+        "-p",
+        "--precision",
+        required=True,
+        choices=SUPPORTED_PRECISIONS,
+        nargs="+",
+        help="Precision(s) of model. You can specify multiple precisions separated by space.",
+    )
+    parser.add_argument(
+        "--layernorm-policy",
+        default="fp32",
+        choices=SUPPORTED_LAYERNORM_POLICIES,
+        help=(
+            "Controls the ONNX LayerNorm dtype policy. "
+            "'fp32' preserves the current export behavior by casting LayerNorm to float32. "
+            "'io' keeps LayerNorm in the model I/O dtype to reduce cast overhead."
+        ),
+    )
+    parser.add_argument(
+        "--rope-cache-length",
+        type=int,
+        default=None,
+        help=(
+            "Override the precomputed RoPE cache length saved into the exported model. "
+            "Use a smaller value for mobile-only builds to reduce fixed initializer size."
+        ),
+    )
+    parser.add_argument(
+        "--lm-head-policy",
+        default="last_token",
+        choices=SUPPORTED_LM_HEAD_POLICIES,
+        help=(
+            "Controls how the LM head is exported. "
+            "'full_logits' preserves the old behavior of computing logits for the full sequence "
+            "and then slicing the last token. "
+            "'last_token' slices the final hidden state first to reduce temporary logits memory. "
+            "'chunked_argmax' computes greedy next-token ids over vocabulary chunks and outputs "
+            "next_token_id instead of full logits."
+        ),
+    )
+    parser.add_argument(
+        "--lm-head-vocab-chunk-count",
+        type=int,
+        default=1,
+        help=(
+            "Split the LM-head vocabulary dimension into N chunks. "
+            "Primarily useful with --lm-head-policy chunked_argmax."
+        ),
+    )
+    parser.add_argument(
+        "--pretranspose-lm-head",
+        action="store_true",
+        help=(
+            "Materialize a dedicated transposed LM head weight initializer during export. "
+            "This increases model size but can reduce runtime transpose-related allocations."
+        ),
+    )
+    parser.add_argument(
+        "--lm-head-dtype",
+        default="io",
+        choices=SUPPORTED_LM_HEAD_DTYPES,
+        help=(
+            "Controls the compute dtype used by the LM head. "
+            "'io' keeps the LM head in the model I/O dtype. "
+            "'fp32' uses a float32 LM head and only casts the LM head input."
+        ),
+    )
+    return parser
+
+
+def export_models(args) -> None:
+    output_dir = Path(args.output)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    precisions = [args.precision] if isinstance(args.precision, str) else list(args.precision)
+    if not precisions:
+        raise ValueError("At least one precision must be specified.")
+
+    print(f"Saving config and processing files in {output_dir}")
+    config = AutoConfig.from_pretrained(args.model_name)
+    config.save_pretrained(output_dir)
+
+    generation_config = GenerationConfig.from_pretrained(config._name_or_path)
+    generation_config.save_pretrained(output_dir)
+
+    tokenizer = AutoTokenizer.from_pretrained(config._name_or_path)
+    tokenizer.save_pretrained(output_dir)
+
+    tokenizer_config_path = output_dir / "tokenizer_config.json"
+    if tokenizer_config_path.exists():
+        tokenizer_config = json.loads(tokenizer_config_path.read_text())
+        if hasattr(tokenizer, "chat_template") and tokenizer.chat_template is not None:
+            tokenizer_config["chat_template"] = tokenizer.chat_template
+        tokenizer_config_path.write_text(json.dumps(tokenizer_config, indent=2))
+
+    tokenizer_path = output_dir / "tokenizer.json"
+    if tokenizer_path.exists():
+        tokenizer_json = json.loads(tokenizer_path.read_text())
+        tokenizer_path.write_text(json.dumps(tokenizer_json))
+
+    model_output_dir = output_dir / "onnx"
+    model_output_dir.mkdir(parents=True, exist_ok=True)
+
+    for precision in [precision.lower() for precision in precisions]:
+        filename = "model.onnx" if precision == "fp32" else f"model_{precision}.onnx"
+        onnx_model = Gemma3Model(
+            config,
+            precision=precision,
+            layernorm_policy=args.layernorm_policy,
+            rope_cache_length=args.rope_cache_length,
+            lm_head_policy=args.lm_head_policy,
+            pretranspose_lm_head=args.pretranspose_lm_head,
+            lm_head_dtype=args.lm_head_dtype,
+        )
+        onnx_model.build_model()
+        onnx_model.save_model(str(model_output_dir / filename))
+
+    config_path = output_dir / "config.json"
+    config_data = json.loads(config_path.read_text())
+    config_data["transformers.js_config"] = {
+        "dtype": "fp32",
+        "use_external_data_format": True,
+        "kv_cache_dtype": {
+            "fp16": "float16",
+        },
+    }
+    config_path.write_text(json.dumps(config_data, indent=2))
 
 
 def get_io_dtype(precision) -> ir.DataType:
-    return ir.DataType.FLOAT if precision in {"q4", "fp32"} else ir.DataType.FLOAT16
-
-
-def get_onnx_dtype(precision: str) -> ir.DataType:
-    if precision in ("q4", "q4f16"):
-        return ir.DataType.INT4
-    return {"fp32": ir.DataType.FLOAT, "fp16": ir.DataType.FLOAT16}[precision]
+    return ir.DataType.FLOAT if precision == "fp32" else ir.DataType.FLOAT16
 
 
 @dataclass
@@ -41,9 +180,36 @@ class RopeCacheConfig:
 
 
 class Gemma3Model:
-    def __init__(self, config: PretrainedConfig, *, precision: str = "fp32"):
+    def __init__(
+        self,
+        config: PretrainedConfig,
+        *,
+        precision: str = "fp32",
+        layernorm_policy: str = "fp32",
+        rope_cache_length: Optional[int] = None,
+        lm_head_policy: str = "last_token",
+        pretranspose_lm_head: bool = False,
+        lm_head_dtype: str = "io",
+    ):
         if precision not in SUPPORTED_PRECISIONS:
             raise ValueError(f"Unsupported precision: {precision}. Supported: {SUPPORTED_PRECISIONS}")
+        if layernorm_policy not in SUPPORTED_LAYERNORM_POLICIES:
+            raise ValueError(
+                f"Unsupported layernorm_policy: {layernorm_policy}. "
+                f"Supported: {SUPPORTED_LAYERNORM_POLICIES}"
+            )
+        if lm_head_policy not in SUPPORTED_LM_HEAD_POLICIES:
+            raise ValueError(
+                f"Unsupported lm_head_policy: {lm_head_policy}. "
+                f"Supported: {SUPPORTED_LM_HEAD_POLICIES}"
+            )
+        if lm_head_dtype not in SUPPORTED_LM_HEAD_DTYPES:
+            raise ValueError(
+                f"Unsupported lm_head_dtype: {lm_head_dtype}. "
+                f"Supported: {SUPPORTED_LM_HEAD_DTYPES}"
+            )
+        architecture = config.architectures[0]
+        assert architecture == "Gemma3ForCausalLM", f"Architecture {architecture} is not supported"
 
         # Model configuration
         self.config = config
@@ -58,8 +224,12 @@ class Gemma3Model:
 
         # Data types
         self.io_dtype: ir.DataType = get_io_dtype(precision)
-        self.onnx_dtype: ir.DataType = get_onnx_dtype(precision)
-        self.use_fp32_layernorm = True
+        self.layernorm_policy = layernorm_policy
+        self.use_fp32_layernorm = layernorm_policy == "fp32"
+        self.lm_head_policy = lm_head_policy
+        self.pretranspose_lm_head = pretranspose_lm_head
+        self.lm_head_dtype = ir.DataType.FLOAT if lm_head_dtype == "fp32" else self.io_dtype
+        self.lm_head_vocab_chunk_count = 1
 
         # ONNX graph construction state
         graph = ir.Graph(inputs=(), outputs=(), nodes=(), opset_imports={"": 21, "com.microsoft": 1}, name="main_graph")
@@ -67,6 +237,8 @@ class Gemma3Model:
         self.values: dict[str, ir.Value] = {}
         self.node_names = set()
         self.embedding_weight_name = None  # For tied embeddings
+        self.lm_head_weight_name = None
+        self.lm_head_chunk_weight_names: Optional[list[str]] = None
 
         # RoPE (Rotary Positional Embedding) configuration
         self.rope_attrs = {
@@ -80,39 +252,24 @@ class Gemma3Model:
                 theta=config.rope_theta,
                 cos_cache_name="cos_cache_global",
                 sin_cache_name="sin_cache_global",
-                cache_length=config.max_position_embeddings,
+                cache_length=rope_cache_length or config.max_position_embeddings,
             ),
             "local": RopeCacheConfig(
                 theta=config.rope_local_base_freq,
                 cos_cache_name="cos_cache_local",
                 sin_cache_name="sin_cache_local",
-                cache_length=config.max_position_embeddings,
+                cache_length=rope_cache_length or config.max_position_embeddings,
             ),
         }
 
     def save_model(self, out_path: str):
-        model = self.to_int4() if self.onnx_dtype == ir.DataType.INT4 else self.model
-
         # Ensure the graph is topologically sorted before saving
-        model.graph.sort()
-        proto = serialize_model(model)
+        self.model.graph.sort()
+        proto = serialize_model(self.model)
 
         # Save with external data to handle large models
         data_location = os.path.basename(out_path) + "_data"
         onnx.save_model(proto, out_path, save_as_external_data=True, all_tensors_to_one_file=True, location=data_location)
-
-    def to_int4(self) -> ir.Model:
-        quantizer = MatMulNBitsQuantizer(
-            model=ir.to_proto(self.model),
-            block_size=32,
-            is_symmetric=True,
-            accuracy_level=4,
-            nodes_to_exclude=[],
-            quant_format=QuantFormat.QOperator,
-            op_types_to_quantize=("MatMul",),
-        )
-        quantizer.process()
-        return ir.from_proto(quantizer.model.model)
 
     def _make_value(self, name: str, dtype: Optional[ir.DataType] = None, shape: Optional[Sequence[Union[int, str]]] = None) -> ir.Value:
         if not name:
@@ -181,20 +338,64 @@ class Gemma3Model:
         return output
 
     def _make_matmul(self, root_input: str, weight: torch.Tensor, basename: str, output_shape_dims: list) -> str:
-        output = f"{basename}/output_0"
         weight_name = basename[1:].replace("/", ".") + ".weight"
+        matmul_output = f"{basename}/output_0"
+        self._make_initializer(weight.T, weight_name, to=self.io_dtype)
+        self._make_node("MatMul", [root_input, weight_name], [matmul_output], name=basename)
 
-        if self.onnx_dtype == ir.DataType.INT4:
-            # For INT4, quantizer will handle it, for now create FP node
-            self._make_initializer(weight.T, weight_name, to=self.io_dtype)
-            self._make_node("MatMul", [root_input, weight_name], [output], name=basename)
-        else:
-            # For FP16/FP32
-            self._make_initializer(weight.T, weight_name, to=self.io_dtype)
-            self._make_node("MatMul", [root_input, weight_name], [output], name=basename)
+        output_shape = ['batch_size', 'sequence_length', output_shape_dims[-1]]
+        self._make_value(matmul_output, self.io_dtype, shape=output_shape)
+        return matmul_output
 
-        self._make_value(output, self.io_dtype, shape=['batch_size', 'sequence_length', output_shape_dims[-1]])
-        return output
+    def _make_split(
+        self,
+        root_input: str,
+        basename: str,
+        split_sizes: Sequence[int],
+        *,
+        axis: int = -1,
+        dtype: Optional[ir.DataType] = None,
+        output_shapes: Optional[Sequence[Sequence[Union[int, str]]]] = None,
+    ) -> list[str]:
+        output_names = [f"{basename}/output_{i}" for i in range(len(split_sizes))]
+        split_const = f"/model/constants/INT64/{list(split_sizes)}"
+        self._make_node("Split", [root_input, split_const], output_names, name=basename, axis=axis)
+        output_dtype = dtype or self.values[root_input].dtype
+        if output_shapes is None:
+            root_shape = list(self.values[root_input].shape)
+            normalized_axis = axis if axis >= 0 else len(root_shape) + axis
+            output_shapes = []
+            for split_size in split_sizes:
+                output_shape = list(root_shape)
+                output_shape[normalized_axis] = split_size
+                output_shapes.append(output_shape)
+        for output_name, shape in zip(output_names, output_shapes):
+            self._make_value(output_name, output_dtype, shape=shape)
+        return output_names
+
+    def _get_zero_bias_name(self, size: int, dtype: ir.DataType) -> str:
+        bias_name = f"model.zero_bias.{size}.{dtype.name}"
+        if bias_name not in self.values or self.values[bias_name].const_value is None:
+            self._make_initializer(torch.zeros(size, dtype=to_torch_dtype(dtype)), bias_name, to=dtype)
+        return bias_name
+
+    def _get_hidden_zero_bias_name(self, dtype: ir.DataType) -> str:
+        return self._get_zero_bias_name(self.hidden_size, dtype)
+
+    def _build_restore_shape(self, root_input: str, last_dim: int, basename: str) -> str:
+        shape_out = self._make_op("Shape", f"{basename}/Shape", [root_input], ir.DataType.INT64, [3])
+        batch = self._make_op("Gather", f"{basename}/Batch", [shape_out, "/model/constants/INT64/0"], ir.DataType.INT64, [], axis=0)
+        seq = self._make_op("Gather", f"{basename}/Seq", [shape_out, "/model/constants/INT64/1"], ir.DataType.INT64, [], axis=0)
+        batch_u = self._make_op("Unsqueeze", f"{basename}/BatchUnsqueeze", [batch, "/model/constants/INT64/[0]"], ir.DataType.INT64, [1])
+        seq_u = self._make_op("Unsqueeze", f"{basename}/SeqUnsqueeze", [seq, "/model/constants/INT64/[0]"], ir.DataType.INT64, [1])
+        return self._make_op(
+            "Concat",
+            f"{basename}/Concat",
+            [batch_u, seq_u, f"/model/constants/INT64/[{last_dim}]"],
+            ir.DataType.INT64,
+            [3],
+            axis=0,
+        )
 
     # ------------------------------------------------------------------------------------
     # Model Component Building Methods
@@ -210,6 +411,7 @@ class Gemma3Model:
         }
         output_shapes = {
             "logits": ["batch_size", "sequence_length", self.vocab_size],
+            "next_token_id": ["batch_size", 1],
             "present": ["batch_size", self.num_kv_heads, "total_sequence_length", self.head_dim],
         }
 
@@ -221,7 +423,12 @@ class Gemma3Model:
         ])
 
         # Create main output
-        self.model.graph.outputs.append(self._make_value("logits", ir.DataType.FLOAT, output_shapes["logits"]))
+        if self.lm_head_policy == "chunked_argmax":
+            self.model.graph.outputs.append(
+                self._make_value("next_token_id", ir.DataType.INT64, output_shapes["next_token_id"])
+            )
+        else:
+            self.model.graph.outputs.append(self._make_value("logits", ir.DataType.FLOAT, output_shapes["logits"]))
 
         # Create KV cache inputs and outputs for each layer
         for i in range(self.num_layers):
@@ -238,13 +445,45 @@ class Gemma3Model:
         weight_name = "model.embed_tokens.weight"
         self._make_initializer(embedding_weight, weight_name, to=self.io_dtype)
         self.embedding_weight_name = weight_name
+        if self.tie_word_embeddings and self.pretranspose_lm_head:
+            if self.lm_head_policy == "chunked_argmax" and self.lm_head_vocab_chunk_count > 1:
+                if self.vocab_size % self.lm_head_vocab_chunk_count != 0:
+                    raise ValueError(
+                        f"vocab_size={self.vocab_size} must be divisible by "
+                        f"lm_head_vocab_chunk_count={self.lm_head_vocab_chunk_count}"
+                    )
+                chunk_vocab = self.vocab_size // self.lm_head_vocab_chunk_count
+                self.lm_head_chunk_weight_names = []
+                transposed = embedding_weight.T
+                for chunk_idx in range(self.lm_head_vocab_chunk_count):
+                    start = chunk_idx * chunk_vocab
+                    end = start + chunk_vocab
+                    chunk_weight_name = f"lm_head.chunk_{chunk_idx}.weight_t"
+                    self._make_initializer(transposed[:, start:end], chunk_weight_name, to=self.lm_head_dtype)
+                    self.lm_head_chunk_weight_names.append(chunk_weight_name)
+            else:
+                lm_head_weight_name = "lm_head.weight_t"
+                self._make_initializer(embedding_weight.T, lm_head_weight_name, to=self.lm_head_dtype)
+                self.lm_head_weight_name = lm_head_weight_name
 
         basename = "/model/embed_tokens"
-        gather_out = self._make_op("Gather", f"{basename}/Gather", [weight_name, 'input_ids'], self.io_dtype, ['batch_size', 'sequence_length', self.hidden_size])
+        gather_out = self._make_op(
+            "Gather",
+            f"{basename}/Gather",
+            [weight_name, 'input_ids'],
+            self.io_dtype,
+            ['batch_size', 'sequence_length', self.hidden_size],
+        )
 
         # Scale the embeddings
         scale_const = f"/model/constants/{self.io_dtype.name}/{np.sqrt(self.hidden_size)}"
-        return self._make_op("Mul", f"{basename}/Mul", [gather_out, scale_const], self.io_dtype, ['batch_size', 'sequence_length', self.hidden_size])
+        return self._make_op(
+            "Mul",
+            f"{basename}/Mul",
+            [gather_out, scale_const],
+            self.io_dtype,
+            ['batch_size', 'sequence_length', self.hidden_size],
+        )
 
     def _build_layernorm(self, root_input: str, weight: torch.Tensor, basename: str, is_final_norm: bool = False, shape_override: Optional[list] = None) -> str:
         norm_dtype = ir.DataType.FLOAT if self.use_fp32_layernorm else self.io_dtype
@@ -365,14 +604,9 @@ class Gemma3Model:
 
     def _build_mlp(self, root_input: str, layer_id: int, mlp_torch) -> str:
         basename = f"/model/layers.{layer_id}/mlp"
-
-        # Gate and Up projections
         gate_proj = self._make_matmul(root_input, mlp_torch.gate_proj.weight, f"{basename}/gate_proj/MatMul", [self.config.intermediate_size])
         up_proj = self._make_matmul(root_input, mlp_torch.up_proj.weight, f"{basename}/up_proj/MatMul", [self.config.intermediate_size])
-
-        # Activation function (FastGelu)
         activated_gate = self._make_op("Gelu", f"{basename}/act_fn/FastGelu", [gate_proj], self.io_dtype, ['batch_size', 'sequence_length', self.config.intermediate_size], approximate="tanh")
-
         # Element-wise multiplication
         mul_out = self._make_op("Mul", f"{basename}/Mul", [activated_gate, up_proj], self.io_dtype, ['batch_size', 'sequence_length', self.config.intermediate_size])
 
@@ -388,9 +622,9 @@ class Gemma3Model:
         attn_out = self._build_attention(norm1_out, layer_id, layer_torch, seqlens_k, total_seq_len, pos_ids_reformatted)
         norm2_out = self._build_layernorm(attn_out, layer_torch.post_attention_layernorm.weight, f"{basename}/post_attention_layernorm")
         residual2 = self._make_op("Add", f"{basename}/Add_1", [residual, norm2_out], self.io_dtype, self.values[residual].shape)
+        norm3_out = self._build_layernorm(residual2, layer_torch.pre_feedforward_layernorm.weight, f"{basename}/pre_feedforward_layernorm")
 
         # MLP block with pre-normalization and residual connection
-        norm3_out = self._build_layernorm(residual2, layer_torch.pre_feedforward_layernorm.weight, f"{basename}/pre_feedforward_layernorm")
         mlp_out = self._build_mlp(norm3_out, layer_id, layer_torch.mlp)
         norm4_out = self._build_layernorm(mlp_out, layer_torch.post_feedforward_layernorm.weight, f"{basename}/post_feedforward_layernorm")
 
@@ -400,33 +634,163 @@ class Gemma3Model:
         if not self.tie_word_embeddings:
             raise NotImplementedError("Only tied embeddings are currently supported.")
 
-        # Transpose the embedding weights: [vocab_size, hidden_size] -> [hidden_size, vocab_size]
-        transposed_weight = self._make_op("Transpose", "/lm_head/Transpose", [self.embedding_weight_name], self.io_dtype, [self.hidden_size, self.vocab_size], perm=[1, 0])
+        lm_head_input = hidden_states
+        if self.lm_head_policy in {"last_token", "chunked_argmax"}:
+            gather_indices = self._make_op(
+                "Constant",
+                "/lm_head/LastToken/indices",
+                [],
+                ir.DataType.INT64,
+                [1],
+                value=ir.tensor([-1], dtype=ir.DataType.INT64, name="/model/constants/INT64/[-1]"),
+            )
+            lm_head_input = self._make_op(
+                "Gather",
+                "/lm_head/LastToken/Gather",
+                [hidden_states, gather_indices],
+                self.io_dtype,
+                ['batch_size', 1, self.hidden_size],
+                axis=1,
+            )
+
+        if self.values[lm_head_input].dtype != self.lm_head_dtype:
+            lm_head_input = self._make_cast(
+                lm_head_input,
+                self.lm_head_dtype,
+                "/lm_head/InputCast",
+                shape=self.values[lm_head_input].shape,
+            )
+
+        if self.lm_head_weight_name is not None:
+            transposed_weight = self.lm_head_weight_name
+        else:
+            # Transpose the embedding weights: [vocab_size, hidden_size] -> [hidden_size, vocab_size]
+            transposed_weight = self._make_op(
+                "Transpose",
+                "/lm_head/Transpose",
+                [self.embedding_weight_name],
+                self.io_dtype,
+                [self.hidden_size, self.vocab_size],
+                perm=[1, 0],
+            )
+            if self.lm_head_dtype != self.io_dtype:
+                transposed_weight = self._make_cast(
+                    transposed_weight,
+                    self.lm_head_dtype,
+                    "/lm_head/WeightCast",
+                    shape=[self.hidden_size, self.vocab_size],
+                )
+
+        if self.lm_head_policy == "chunked_argmax":
+            if self.vocab_size % self.lm_head_vocab_chunk_count != 0:
+                raise ValueError(
+                    f"vocab_size={self.vocab_size} must be divisible by "
+                    f"lm_head_vocab_chunk_count={self.lm_head_vocab_chunk_count}"
+                )
+
+            chunk_vocab = self.vocab_size // self.lm_head_vocab_chunk_count
+            if self.lm_head_chunk_weight_names is not None:
+                weight_chunks = self.lm_head_chunk_weight_names
+            else:
+                weight_chunks = self._make_split(
+                    transposed_weight,
+                    "/lm_head/WeightSplit",
+                    [chunk_vocab] * self.lm_head_vocab_chunk_count,
+                    axis=1,
+                    dtype=self.lm_head_dtype,
+                    output_shapes=[[self.hidden_size, chunk_vocab]] * self.lm_head_vocab_chunk_count,
+                )
+
+            best_values = None
+            best_indices = None
+            for chunk_idx, weight_chunk in enumerate(weight_chunks):
+                chunk_basename = f"/lm_head/Chunk{chunk_idx}"
+                chunk_logits = f"{chunk_basename}/MatMul/output_0"
+                self._make_node("MatMul", [lm_head_input, weight_chunk], [chunk_logits], name=f"{chunk_basename}/MatMul")
+                self._make_value(chunk_logits, self.lm_head_dtype, ['batch_size', 1, chunk_vocab])
+
+                local_values = self._make_op(
+                    "ReduceMax",
+                    f"{chunk_basename}/ReduceMax",
+                    [chunk_logits, "/model/constants/INT64/[2]"],
+                    self.lm_head_dtype,
+                    ['batch_size', 1],
+                    keepdims=0,
+                )
+                local_indices = self._make_op(
+                    "ArgMax",
+                    f"{chunk_basename}/ArgMax",
+                    [chunk_logits],
+                    ir.DataType.INT64,
+                    ['batch_size', 1],
+                    axis=2,
+                    keepdims=0,
+                    select_last_index=0,
+                )
+
+                offset = chunk_idx * chunk_vocab
+                if offset:
+                    offset_name = f"/model/constants/INT64/[{offset}]"
+                    global_indices = self._make_op(
+                        "Add",
+                        f"{chunk_basename}/IndexOffset",
+                        [local_indices, offset_name],
+                        ir.DataType.INT64,
+                        ['batch_size', 1],
+                    )
+                else:
+                    global_indices = local_indices
+
+                if best_values is None:
+                    best_values = local_values
+                    best_indices = global_indices
+                    continue
+
+                better_mask = self._make_op(
+                    "Greater",
+                    f"{chunk_basename}/Greater",
+                    [local_values, best_values],
+                    ir.DataType.BOOL,
+                    ['batch_size', 1],
+                )
+                best_values = self._make_op(
+                    "Where",
+                    f"{chunk_basename}/SelectValues",
+                    [better_mask, local_values, best_values],
+                    self.lm_head_dtype,
+                    ['batch_size', 1],
+                )
+                best_indices = self._make_op(
+                    "Where",
+                    f"{chunk_basename}/SelectIndices",
+                    [better_mask, global_indices, best_indices],
+                    ir.DataType.INT64,
+                    ['batch_size', 1],
+                )
+
+            self._make_node("Identity", [best_indices], ["next_token_id"], name="/lm_head/NextTokenIdentity")
+            self._make_value("next_token_id", ir.DataType.INT64, ['batch_size', 1])
+            return
+
         logits_dtype = ir.DataType.FLOAT  # The final logits output is always float32
-        full_logits_shape = ['batch_size', 'sequence_length', self.vocab_size]
         logits_shape = ['batch_size', 1, self.vocab_size]
-        cast_needed = self.io_dtype != logits_dtype
+        cast_needed = self.lm_head_dtype != logits_dtype
 
         # Create the MatMul node for the language model head.
         matmul_output_name = "/lm_head/MatMul/output_0"
-        matmul_output_dtype = self.io_dtype
-        self._make_node("MatMul", [hidden_states, transposed_weight], [matmul_output_name], name="/lm_head/MatMul")
-        self._make_value(matmul_output_name, matmul_output_dtype, full_logits_shape)
-
-        # Slice to get only the last token's logits for efficiency
-        # Gather the last element along sequence_length dimension (axis=1)
-        gather_indices = self._make_op("Constant", "/lm_head/Gather/indices", [], ir.DataType.INT64, [1], value=ir.tensor([-1], dtype=ir.DataType.INT64, name="/model/constants/INT64/[-1]"))
-        last_logits_gather = self._make_op("Gather", "/lm_head/Gather", [matmul_output_name, gather_indices], matmul_output_dtype, logits_shape, axis=1)
+        matmul_output_dtype = self.lm_head_dtype
+        self._make_node("MatMul", [lm_head_input, transposed_weight], [matmul_output_name], name="/lm_head/MatMul")
+        self._make_value(matmul_output_name, matmul_output_dtype, logits_shape)
 
         if cast_needed:
             # Create a cast node to convert the sliced logits to float32 for the final logits.
-            self._make_node("Cast", [last_logits_gather], ["logits"], name="/lm_head/CastToFloat", to=logits_dtype)
+            self._make_node("Cast", [matmul_output_name], ["logits"], name="/lm_head/CastToFloat", to=logits_dtype)
             self._make_value("logits", logits_dtype, logits_shape)
         else:
             # If no cast needed, directly use the sliced logits as output
             self._make_value("logits", logits_dtype, logits_shape)
             # Create an identity operation to rename the output
-            self._make_node("Identity", [last_logits_gather], ["logits"], name="/lm_head/Identity")
+            self._make_node("Identity", [matmul_output_name], ["logits"], name="/lm_head/Identity")
 
     def _build_preprocessing(self) -> tuple[str, str, str]:
         basename = "/model/preprocessing"
@@ -479,115 +843,11 @@ class Gemma3Model:
         print("ONNX model construction complete.")
         del torch_model
 
+def main() -> None:
+    parser = build_parser()
+    args = parser.parse_args()
+    export_models(args)
 
-@torch.no_grad
-def create_model(
-    config: PretrainedConfig,
-    precision: str,
-):
-    options = dict(precision=precision)
-    architecture = config.architectures[0]
-
-    assert architecture == "Gemma3ForCausalLM", f"Architecture {architecture} is not supported"
-    onnx_model = Gemma3Model(config, **options)
-    return onnx_model
 
 if __name__ == "__main__":
-    import argparse
-    import json
-    from transformers import GenerationConfig, AutoTokenizer
-
-    parser = argparse.ArgumentParser(formatter_class=argparse.RawTextHelpFormatter)
-
-    parser.add_argument(
-        "-m",
-        "--model_name",
-        required=True,
-        help="Model name in Hugging Face. Do not use if providing an input path to a Hugging Face directory in -i/--input.",
-    )
-
-    parser.add_argument(
-        "-o",
-        "--output",
-        required=False,
-        help="Path to folder to store generated files",
-    )
-    parser.add_argument(
-        "-p",
-        "--precision",
-        required=True,
-        choices=SUPPORTED_PRECISIONS,
-        nargs='+',
-        help="Precision(s) of model. You can specify multiple precisions separated by space.",
-    )
-
-    args = parser.parse_args()
-
-    model_name = args.model_name
-    output_dir = args.output
-    precision = args.precision
-
-    # Support list of precisions
-    precisions = [precision] if isinstance(precision, str) else precision
-    if len(precisions) == 0:
-        raise ValueError("At least one precision must be specified.")
-
-    os.makedirs(output_dir, exist_ok=True)
-    print(f"Saving config and processing files in {output_dir}")
-    config = AutoConfig.from_pretrained(model_name)
-    config.save_pretrained(output_dir)
-
-    generation_config = GenerationConfig.from_pretrained(config._name_or_path)
-    generation_config.save_pretrained(output_dir)
-
-    processor = AutoTokenizer.from_pretrained(config._name_or_path)
-    processor.save_pretrained(output_dir)
-
-    # Post-process tokenizer config
-    tokenizer_config_path = os.path.join(output_dir, "tokenizer_config.json")
-    if os.path.exists(tokenizer_config_path):
-        with open(tokenizer_config_path, "r") as fp:
-            tokenizer_config = json.load(fp)
-        if hasattr(processor, "chat_template") and processor.chat_template is not None:
-            tokenizer_config["chat_template"] = processor.chat_template
-        with open(tokenizer_config_path, "w") as fp:
-            json.dump(tokenizer_config, fp, indent=2)
-
-    # Minify tokenizer
-    tokenizer_path = os.path.join(output_dir, "tokenizer.json")
-    if os.path.exists(tokenizer_path):
-        with open(tokenizer_path, "r") as fp:
-            tokenizer_json = json.load(fp)
-        with open(tokenizer_path, "w") as fp:
-            json.dump(tokenizer_json, fp)
-
-    for precision in precisions:
-        precision = precision.lower()
-        if precision == "fp32":
-            filename = "model.onnx"
-        else:
-            filename = f"model_{precision}.onnx"
-
-        onnx_model = create_model(config, precision)
-
-        # Build ONNX model
-        onnx_model.build_model()
-
-        # Save ONNX model
-        model_output_path = os.path.join(output_dir, "onnx")
-        os.makedirs(model_output_path, exist_ok=True)
-        onnx_model.save_model(os.path.join(model_output_path, filename))
-
-    # Post-process config files
-    with open(os.path.join(output_dir, "config.json"), "r") as fp:
-        config_data = json.load(fp)
-    config_data["transformers.js_config"] = {
-        "dtype": "fp32",
-        "use_external_data_format": True,
-    }
-    config_data["transformers.js_config"]["kv_cache_dtype"] = {
-        "q4f16": "float16",
-        "fp16": "float16"
-    }
-    with open(os.path.join(output_dir, "config.json"), "w") as fp:
-        json.dump(config_data, fp, indent=2)
+    main()

@@ -25,16 +25,17 @@ final class UserToolsetTemplate {
               {
                 "type": "function",
                 "function": {
-                  "name": "launch_app",
-                  "description": "Open an app itself. Do not use this for navigation, music playback, web search, or system settings.",
+                  "name": "open_target",
+                  "description": "Open an app or a system settings page. Copy the exact target text from the user's request into target.",
                   "parameters": {
                     "type": "object",
                     "properties": {
-                      "app_name": {
+                      "target": {
                         "type": "string",
-                        "description": "App name"
+                        "description": "Copy the exact target text from the user's request after 打开. Keep the original text as-is. Do not translate, paraphrase, romanize, or normalize it."
                       }
-                    }
+                    },
+                    "required": ["target"]
                   }
                 }
               },
@@ -42,7 +43,7 @@ final class UserToolsetTemplate {
                 "type": "function",
                 "function": {
                   "name": "navigate",
-                  "description": "Navigate to a destination. The default map app is 高德地图.",
+                  "description": "Navigate to a destination in the map app.",
                   "parameters": {
                     "type": "object",
                     "properties": {
@@ -54,7 +55,8 @@ final class UserToolsetTemplate {
                         "type": "string",
                         "description": "Optional mode such as driving, walking, transit"
                       }
-                    }
+                    },
+                    "required": ["destination"]
                   }
                 }
               },
@@ -62,7 +64,7 @@ final class UserToolsetTemplate {
                 "type": "function",
                 "function": {
                   "name": "play_music",
-                  "description": "Play or search music. If both artist and song appear, extract them separately. Prefer this over launch_app for music requests.",
+                  "description": "Play or search music. Do not use this just to open a music app.",
                   "parameters": {
                     "type": "object",
                     "properties": {
@@ -86,7 +88,7 @@ final class UserToolsetTemplate {
                 "type": "function",
                 "function": {
                   "name": "web_search",
-                  "description": "Search the web.",
+                  "description": "Search the web in a browser.",
                   "parameters": {
                     "type": "object",
                     "properties": {
@@ -94,27 +96,11 @@ final class UserToolsetTemplate {
                         "type": "string",
                         "description": "Search query"
                       }
-                    }
+                    },
+                    "required": ["query"]
                   }
                 }
               },
-              {
-                "type": "function",
-                "function": {
-                  "name": "open_system_panel",
-                  "description": "Open a system panel such as bluetooth, wifi, internet, or settings.",
-                  "parameters": {
-                    "type": "object",
-                    "properties": {
-                      "panel": {
-                        "type": "string",
-                        "description": "Panel name",
-                        "enum": ["bluetooth", "wifi", "internet", "settings"]
-                      }
-                    }
-                  }
-                }
-              }
             ]
             """;
 
