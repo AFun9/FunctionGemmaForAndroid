@@ -16,7 +16,17 @@ The Android runtime in this repository expects:
 - a tokenizer bundle matching the runtime tokenizer path
 - export behavior aligned with the project's optimized prefill workflow
 
-The conversion logic is based on the official Gemma export approach, but this project retains a runtime-specific optimization for prefill logits.
+The conversion logic is based on the official Gemma export approach, but the local script is intentionally narrower than the original experimental exporter. It only keeps the export paths that are still used by this Android runtime.
+
+## What Was Simplified
+
+The exporter in this repository was reduced to the minimum feature set that still matches the Android app:
+
+- only `fp32` and `fp16` export are kept
+- old experimental branches that were not part of the current mobile runtime path were removed
+- the CLI now focuses on a small number of runtime-relevant export controls instead of a wide set of one-off switches
+
+This makes the script easier to reason about and reduces the chance of exporting a model shape or dtype combination that the Android runtime does not actually use.
 
 ## Precision Export vs Runtime Support
 
@@ -57,21 +67,44 @@ Even when the exported weight precision is reduced, total runtime memory can rem
 
 For that reason, precision conversion should always be evaluated together with the actual runtime implementation, not only with the exported model size.
 
-## Runtime-Oriented Export Adjustment
+## Runtime-Oriented Export Adjustments
 
-The default export pattern may keep logits for the entire sequence:
+### 1. Last-token LM head by default
+
+The main optimization kept in this repository is that the default LM head export path is `last_token`.
+
+The older full-sequence export pattern keeps logits for the entire sequence:
 
 ```python
 logits_shape = ["batch_size", "sequence_length", "vocab_size"]
 ```
 
-In this project, prefill only needs the logits of the final token, so the export is adjusted to:
+In this project, prefill only needs the logits of the final token, so the default export is adjusted to:
 
 ```python
 last_logits_shape = ["batch_size", 1, "vocab_size"]
 ```
 
-This reduces unnecessary memory usage and better matches the autoregressive generation path used by the mobile runtime.
+Why this was done:
+
+- the Android runtime only needs the next-token decision after prefill
+- computing full-sequence logits creates unnecessary temporary memory pressure on mobile
+
+Result:
+
+- lower temporary logits memory during generation
+- exported graph behavior is closer to the actual autoregressive runtime path
+
+### 2. Optional mobile-oriented export controls
+
+The script still keeps a few focused controls because they directly affect runtime cost:
+
+- `--layernorm-policy`: keeps LayerNorm in `fp32` by default, with an `io` option to reduce casts
+- `--rope-cache-length`: allows exporting a shorter precomputed RoPE cache to reduce fixed initializer size
+- `--lm-head-dtype`: controls whether the LM head computes in model I/O dtype or `fp32`
+- `--pretranspose-lm-head`: optionally stores a transposed LM head weight to reduce runtime transpose work
+
+These options remain because they are tied to concrete runtime tradeoffs, not because the exporter is intended to be a general-purpose research tool.
 
 ## Prerequisites
 
@@ -81,9 +114,9 @@ Before running the conversion workflow, prepare:
 - access to the official Gemma model checkpoint you intend to convert
 - the conversion script [`build_gemma.py`](build_gemma.py)
 
-## Example Command
+## Example Commands
 
-A typical conversion command may look like this:
+Typical export:
 
 ```bash
 python build_gemma.py \
@@ -92,7 +125,19 @@ python build_gemma.py \
     -p fp32 fp16
 ```
 
-Adjust the model identifier and output path according to your own environment and model source.
+Mobile-oriented export with explicit runtime-related knobs:
+
+```bash
+python build_gemma.py \
+    --model_name "your-org/your-gemma-model" \
+    --output "/path/to/output/model-onnx" \
+    -p fp16 \
+    --lm-head-policy last_token \
+    --layernorm-policy io \
+    --rope-cache-length 4096
+```
+
+Adjust the model identifier, output path, and export options according to your own environment and runtime target.
 
 ## Expected Output
 
@@ -104,6 +149,15 @@ After conversion, the generated output should contain the model and tokenizer as
 - `onnx/model.onnx_data` when external tensor data is emitted
 
 Additional configuration files may also be produced and should be preserved.
+
+## Why These Optimizations Matter
+
+For this project, the goal of export is not just "produce a valid ONNX file". The exported graph should also better match how the Android runtime actually runs:
+
+- smaller and simpler export surface
+- fewer unused experimental branches
+- lower temporary memory pressure during prefill
+- better alignment between exported tensor behavior and the JNI/C++ execution path
 
 ## Integration into This Project
 
